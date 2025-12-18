@@ -796,7 +796,7 @@ __cold unsigned int io_timeouts_armed(struct io_ring_ctx *ctx,
 	struct io_timeout *timeout;
 	unsigned int nr = 0;
 
-	guard(mutex)(&ctx->uring_lock);
+	guard(io_ring_ctx_lock)(ctx);
 	raw_spin_lock_irq(&ctx->timeout_lock);
 	list_for_each_entry(timeout, &ctx->timeout_list, list) {
 		struct io_kiocb *req = cmd_to_io_kiocb(timeout);

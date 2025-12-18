@@ -120,7 +120,7 @@ struct io_mapped_region {
  * Return value from io_buffer_list selection, to avoid stashing it in
  * struct io_kiocb. For legacy/classic provided buffers, keeping a reference
  * across execution contexts are fine. But for ring provided buffers, the
- * list may go away as soon as ->uring_lock is dropped. As the io_kiocb
+ * list may go away as soon as the ctx uring lock is dropped. As the io_kiocb
  * persists, it's better to just keep the buffer local for those cases.
  */
 struct io_br_sel {
@@ -290,7 +290,7 @@ struct io_submit_link {
 };
 
 struct io_submit_state {
-	/* inline/task_work completion list, under ->uring_lock */
+	/* inline/task_work completion list, under ctx uring lock */
 	struct io_wq_work_node	free_list;
 	/* batch completion logic */
 	struct io_wq_work_list	compl_reqs;
@@ -375,12 +375,12 @@ struct io_ring_ctx {
 
 		/*
 		 * Fixed resources fast path, should be accessed only under
-		 * uring_lock, and updated through io_uring_register(2)
+		 * ctx uring lock, and updated through io_uring_register(2)
 		 */
 		atomic_t		cancel_seq;
 
 		/*
-		 * ->iopoll_list is protected by the ctx->uring_lock for
+		 * ->iopoll_list is protected by the ctx uring lock for
 		 * io_uring instances that don't use IORING_SETUP_SQPOLL.
 		 * For SQPOLL, only the single threaded io_sq_thread() will
 		 * manipulate the list, hence no extra locking is needed there.
@@ -389,7 +389,7 @@ struct io_ring_ctx {
 		struct list_head	iopoll_list;
 
 		/*
-		 * Consumer cursor for ->work_list, protected by ->uring_lock.
+		 * Consumer cursor for ->work_list, protected by ctx uring lock.
 		 * Deliberately kept away from the producer side of the queue,
 		 * as it's written for every popped entry, and the producer
 		 * cacheline is contended enough as it is.
@@ -404,7 +404,7 @@ struct io_ring_ctx {
 		struct io_submit_state	submit_state;
 
 		/*
-		 * Modifications are protected by ->uring_lock and ->mmap_lock.
+		 * Modifications protected by ctx uring lock and ->mmap_lock.
 		 * The buffer list's io mapped region should be stable once
 		 * published.
 		 */
@@ -510,7 +510,7 @@ struct io_ring_ctx {
 
 	/*
 	 * List of tctx nodes for this ctx, protected by tctx_lock. For
-	 * cancelation purposes, nests under uring_lock.
+	 * cancelation purposes, nests under the ctx uring lock.
 	 */
 	struct list_head		tctx_list;
 	struct mutex			tctx_lock;
@@ -533,7 +533,7 @@ struct io_ring_ctx {
 
 	/* protected by ->completion_lock */
 	unsigned			nr_req_allocated;
-	/* pending SEND_ZC notifications, protected by ->uring_lock */
+	/* pending SEND_ZC notifications, protected by ctx uring lock */
 	unsigned			nr_notifs;
 
 #ifdef CONFIG_NET_RX_BUSY_POLL
@@ -567,7 +567,7 @@ struct io_ring_ctx {
 
 /*
  * Token indicating function is called in task work context:
- * ctx->uring_lock is held and any completions generated will be flushed.
+ * ctx uring lock is held and any completions generated will be flushed.
  * ONLY core io_uring.c should instantiate this struct.
  */
 struct io_tw_state {

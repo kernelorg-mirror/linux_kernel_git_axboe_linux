@@ -16,7 +16,8 @@
 #include "wait.h"
 #include "mpscq.h"
 
-static void ctx_flush_and_put(struct io_ring_ctx *ctx, io_tw_token_t tw)
+static void ctx_flush_and_put(struct io_ring_ctx *ctx, io_tw_token_t tw,
+			      struct io_ring_ctx_lock_state *lock_state)
 {
 	if (!ctx)
 		return;
@@ -24,7 +25,7 @@ static void ctx_flush_and_put(struct io_ring_ctx *ctx, io_tw_token_t tw)
 		atomic_andnot(IORING_SQ_TASKRUN, &ctx->rings->sq_flags);
 
 	io_submit_flush_completions(ctx);
-	mutex_unlock(&ctx->uring_lock);
+	io_ring_ctx_unlock(ctx, lock_state);
 	percpu_ref_put(&ctx->refs);
 }
 
@@ -63,6 +64,7 @@ static void io_fallback_tw(struct io_uring_task *tctx)
 void tctx_task_work_run(struct io_uring_task *tctx, unsigned int max_entries,
 			unsigned int *count)
 {
+	struct io_ring_ctx_lock_state lock_state;
 	struct io_ring_ctx *ctx = NULL;
 	struct io_tw_state ts = { };
 
@@ -80,16 +82,16 @@ void tctx_task_work_run(struct io_uring_task *tctx, unsigned int max_entries,
 			 * Give it a chance to finish rather than spinning,
 			 * and don't sit on the ctx lock while doing so.
 			 */
-			ctx_flush_and_put(ctx, ts);
+			ctx_flush_and_put(ctx, ts, &lock_state);
 			ctx = NULL;
 			cond_resched();
 			continue;
 		}
 		req = container_of(node, struct io_kiocb, io_task_work.node);
 		if (req->ctx != ctx) {
-			ctx_flush_and_put(ctx, ts);
+			ctx_flush_and_put(ctx, ts, &lock_state);
 			ctx = req->ctx;
-			mutex_lock(&ctx->uring_lock);
+			io_ring_ctx_lock(ctx, &lock_state);
 			percpu_ref_get(&ctx->refs);
 			ts.cancel = io_should_terminate_tw(ctx);
 		}
@@ -105,12 +107,12 @@ void tctx_task_work_run(struct io_uring_task *tctx, unsigned int max_entries,
 		if (mpscq_pop_emptied(&tctx->task_list, tctx->task_head))
 			break;
 		if (unlikely(need_resched())) {
-			ctx_flush_and_put(ctx, ts);
+			ctx_flush_and_put(ctx, ts, &lock_state);
 			ctx = NULL;
 			cond_resched();
 		}
 	}
-	ctx_flush_and_put(ctx, ts);
+	ctx_flush_and_put(ctx, ts, &lock_state);
 
 	/*
 	 * Relaxed read is enough as only the task itself sets ->in_cancel.
@@ -283,14 +285,14 @@ void __cold io_cancel_local_task_work(struct io_ring_ctx *ctx)
 	struct llist_node *node;
 
 	/*
-	 * The work list consumer side is serialized by ->uring_lock, see
+	 * The work list consumer side is serialized by the ctx uring lock, see
 	 * __io_run_local_work(). Grab it to guard against racing with normal
 	 * task_work running, as the task may be exiting. The ring is going
 	 * away, run the entries in cancel mode right here - the callers
 	 * provide the same process context the per-ctx fallback work that
 	 * they were previously punted to ran in.
 	 */
-	guard(mutex)(&ctx->uring_lock);
+	guard(io_ring_ctx_lock)(ctx);
 
 	while (!mpscq_empty(&ctx->work_list)) {
 		struct io_kiocb *req;
@@ -387,11 +389,12 @@ int io_run_local_work_locked(struct io_ring_ctx *ctx, int min_events)
 
 int io_run_local_work(struct io_ring_ctx *ctx, int min_events, int max_events)
 {
+	struct io_ring_ctx_lock_state lock_state;
 	struct io_tw_state ts = {};
 	int ret;
 
-	mutex_lock(&ctx->uring_lock);
+	io_ring_ctx_lock(ctx, &lock_state);
 	ret = __io_run_local_work(ctx, ts, min_events, max_events);
-	mutex_unlock(&ctx->uring_lock);
+	io_ring_ctx_unlock(ctx, &lock_state);
 	return ret;
 }

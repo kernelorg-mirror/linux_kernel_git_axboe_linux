@@ -42,7 +42,7 @@ __u8 *bpf_io_uring_get_region(struct iou_ctx *loop_ctx, __u32 region_id,
 	struct io_ring_ctx *ctx = io_loop_demangle_ctx(loop_ctx);
 	struct io_mapped_region *r;
 
-	lockdep_assert_held(&ctx->uring_lock);
+	io_ring_ctx_assert_locked(ctx);
 
 	switch (region_id) {
 	case IOU_REGION_MEM:
@@ -206,7 +206,7 @@ static int bpf_io_reg(void *kdata, struct bpf_link *link)
 	ctx = file->private_data;
 
 	scoped_guard(mutex, &io_bpf_ctrl_mutex) {
-		guard(mutex)(&ctx->uring_lock);
+		guard(io_ring_ctx_lock)(ctx);
 		ret = io_install_bpf(ctx, ops);
 	}
 
@@ -236,7 +236,7 @@ static void bpf_io_unreg(void *kdata, struct bpf_link *link)
 	guard(mutex)(&io_bpf_ctrl_mutex);
 	ctx = ops->priv;
 	if (ctx) {
-		guard(mutex)(&ctx->uring_lock);
+		guard(io_ring_ctx_lock)(ctx);
 		if (WARN_ON_ONCE(ctx->bpf_ops != ops))
 			return;
 
@@ -247,17 +247,17 @@ static void bpf_io_unreg(void *kdata, struct bpf_link *link)
 void io_unregister_bpf_ops(struct io_ring_ctx *ctx)
 {
 	/*
-	 * ->bpf_ops is write protected by io_bpf_ctrl_mutex and uring_lock,
-	 * and read protected by either. Try to avoid taking the global lock
-	 * for rings that never had any bpf installed.
+	 * ->bpf_ops is write protected by io_bpf_ctrl_mutex and the ctx uring
+	 * lock, and read protected by either. Try to avoid taking the global
+	 * lock for rings that never had any bpf installed.
 	 */
-	scoped_guard(mutex, &ctx->uring_lock) {
+	scoped_guard(io_ring_ctx_lock, ctx) {
 		if (!ctx->bpf_ops)
 			return;
 	}
 
 	guard(mutex)(&io_bpf_ctrl_mutex);
-	guard(mutex)(&ctx->uring_lock);
+	guard(io_ring_ctx_lock)(ctx);
 	if (ctx->bpf_ops)
 		io_eject_bpf(ctx);
 }

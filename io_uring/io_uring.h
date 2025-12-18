@@ -19,6 +19,60 @@
 #include <trace/events/io_uring.h>
 #endif
 
+struct io_ring_ctx_lock_state {
+};
+
+/* Acquire the ctx uring lock with the given nesting level */
+static inline void io_ring_ctx_lock_nested(struct io_ring_ctx *ctx,
+					   unsigned int subclass,
+					   struct io_ring_ctx_lock_state *state)
+{
+	mutex_lock_nested(&ctx->uring_lock, subclass);
+}
+
+/* Acquire the ctx uring lock */
+static inline void io_ring_ctx_lock(struct io_ring_ctx *ctx,
+				    struct io_ring_ctx_lock_state *state)
+{
+	io_ring_ctx_lock_nested(ctx, 0, state);
+}
+
+/* Attempt to acquire the ctx uring lock without blocking */
+static inline bool io_ring_ctx_trylock(struct io_ring_ctx *ctx,
+				       struct io_ring_ctx_lock_state *state)
+{
+	return mutex_trylock(&ctx->uring_lock);
+}
+
+/* Release the ctx uring lock */
+static inline void io_ring_ctx_unlock(struct io_ring_ctx *ctx,
+				      struct io_ring_ctx_lock_state *state)
+{
+	mutex_unlock(&ctx->uring_lock);
+}
+
+/* Return (if CONFIG_LOCKDEP) whether the ctx uring lock is held */
+static inline bool io_ring_ctx_lock_held(const struct io_ring_ctx *ctx)
+{
+	return lockdep_is_held(&ctx->uring_lock);
+}
+
+/* Assert (if CONFIG_LOCKDEP) that the ctx uring lock is held */
+static inline void io_ring_ctx_assert_locked(const struct io_ring_ctx *ctx)
+{
+	lockdep_assert_held(&ctx->uring_lock);
+}
+
+DEFINE_LOCK_GUARD_1(io_ring_ctx_lock, struct io_ring_ctx,
+		    io_ring_ctx_lock(_T->lock, &_T->state),
+		    io_ring_ctx_unlock(_T->lock, &_T->state),
+		    struct io_ring_ctx_lock_state state)
+
+static inline void io_tw_lock(struct io_ring_ctx *ctx, io_tw_token_t tw)
+{
+	io_ring_ctx_assert_locked(ctx);
+}
+
 struct io_rings_layout {
 	/* size of CQ + headers + SQ offset array */
 	size_t rings_size;
@@ -146,7 +200,7 @@ struct io_wait_queue {
 static inline struct io_rings *io_get_rings(struct io_ring_ctx *ctx)
 {
 	return rcu_dereference_check(ctx->rings_rcu,
-			lockdep_is_held(&ctx->uring_lock) ||
+			io_ring_ctx_lock_held(ctx) ||
 			lockdep_is_held(&ctx->completion_lock));
 }
 
@@ -223,10 +277,10 @@ static inline void io_lockdep_assert_cq_locked(struct io_ring_ctx *ctx)
 	lockdep_assert(in_task());
 
 	if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
-		lockdep_assert_held(&ctx->uring_lock);
+		io_ring_ctx_assert_locked(ctx);
 
 	if (ctx->flags & IORING_SETUP_IOPOLL) {
-		lockdep_assert_held(&ctx->uring_lock);
+		io_ring_ctx_assert_locked(ctx);
 	} else if (!(ctx->int_flags & IO_RING_F_TASK_COMPLETE)) {
 		lockdep_assert_held(&ctx->completion_lock);
 	} else if (ctx->submitter_task) {
@@ -377,26 +431,28 @@ static inline void io_put_file(struct io_kiocb *req)
 		fput(req->file);
 }
 
-static inline void io_ring_submit_unlock(struct io_ring_ctx *ctx,
-					 unsigned issue_flags)
+static inline void
+io_ring_submit_unlock(struct io_ring_ctx *ctx, unsigned issue_flags,
+		      struct io_ring_ctx_lock_state *lock_state)
 {
-	lockdep_assert_held(&ctx->uring_lock);
+	io_ring_ctx_assert_locked(ctx);
 	if (unlikely(issue_flags & IO_URING_F_UNLOCKED))
-		mutex_unlock(&ctx->uring_lock);
+		io_ring_ctx_unlock(ctx, lock_state);
 }
 
-static inline void io_ring_submit_lock(struct io_ring_ctx *ctx,
-				       unsigned issue_flags)
+static inline void
+io_ring_submit_lock(struct io_ring_ctx *ctx, unsigned issue_flags,
+		    struct io_ring_ctx_lock_state *lock_state)
 {
 	/*
-	 * "Normal" inline submissions always hold the uring_lock, since we
+	 * "Normal" inline submissions always hold the ctx uring lock, since we
 	 * grab it from the system call. Same is true for the SQPOLL offload.
 	 * The only exception is when we've detached the request and issue it
 	 * from an async worker thread, grab the lock for that case.
 	 */
 	if (unlikely(issue_flags & IO_URING_F_UNLOCKED))
-		mutex_lock(&ctx->uring_lock);
-	lockdep_assert_held(&ctx->uring_lock);
+		io_ring_ctx_lock(ctx, lock_state);
+	io_ring_ctx_assert_locked(ctx);
 }
 
 /*
@@ -405,7 +461,8 @@ static inline void io_ring_submit_lock(struct io_ring_ctx *ctx,
  * the request before that found it running. It has flagged the work item,
  * has searched the list in vain, and won't come back. To be called with
  * the lock the search takes held: if the search came first, the flag is
- * visible. For most lists that is ->uring_lock, timeouts use ->timeout_lock.
+ * visible. For most lists that is the ctx uring lock, timeouts use
+ * ->timeout_lock.
  */
 static inline bool __io_wq_cancel_seen(struct io_kiocb *req,
 				       unsigned int issue_flags)
@@ -417,7 +474,7 @@ static inline bool __io_wq_cancel_seen(struct io_kiocb *req,
 static inline bool io_wq_cancel_seen(struct io_kiocb *req,
 				     unsigned int issue_flags)
 {
-	lockdep_assert_held(&req->ctx->uring_lock);
+	io_ring_ctx_assert_locked(req->ctx);
 
 	return __io_wq_cancel_seen(req, issue_flags);
 }
@@ -495,15 +552,14 @@ static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
 
 /*
  * Don't complete immediately but use deferred completion infrastructure.
- * Protected by ->uring_lock and can only be used either with
+ * Protected by ctx uring lock and can only be used either with
  * IO_URING_F_COMPLETE_DEFER or inside a tw handler holding the mutex.
  */
 static inline void io_req_complete_defer(struct io_kiocb *req)
-	__must_hold(&req->ctx->uring_lock)
 {
 	struct io_submit_state *state = &req->ctx->submit_state;
 
-	lockdep_assert_held(&req->ctx->uring_lock);
+	io_ring_ctx_assert_locked(req->ctx);
 
 	wq_list_add_tail(&req->comp_list, &state->compl_reqs);
 }

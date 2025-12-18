@@ -17,7 +17,8 @@ static inline void io_loop_wait_finish(struct io_ring_ctx *ctx)
 }
 
 static void io_loop_wait(struct io_ring_ctx *ctx, struct iou_loop_params *lp,
-			 unsigned nr_wait)
+			 unsigned nr_wait,
+			 struct io_ring_ctx_lock_state *lock_state)
 {
 	io_cq_wait_arm(ctx, nr_wait);
 
@@ -28,13 +29,14 @@ static void io_loop_wait(struct io_ring_ctx *ctx, struct iou_loop_params *lp,
 		return;
 	}
 
-	mutex_unlock(&ctx->uring_lock);
+	io_ring_ctx_unlock(ctx, lock_state);
 	schedule();
 	io_loop_wait_finish(ctx);
-	mutex_lock(&ctx->uring_lock);
+	io_ring_ctx_lock(ctx, lock_state);
 }
 
-static int __io_run_loop(struct io_ring_ctx *ctx)
+static int __io_run_loop(struct io_ring_ctx *ctx,
+			 struct io_ring_ctx_lock_state *lock_state)
 {
 	struct iou_loop_params lp = {};
 
@@ -52,21 +54,21 @@ static int __io_run_loop(struct io_ring_ctx *ctx)
 
 		nr_wait = io_loop_nr_cqes(ctx, &lp);
 		if (nr_wait > 0)
-			io_loop_wait(ctx, &lp, nr_wait);
+			io_loop_wait(ctx, &lp, nr_wait, lock_state);
 		else
 			nr_wait = 0;
 
 		if (task_work_pending(current)) {
-			mutex_unlock(&ctx->uring_lock);
+			io_ring_ctx_unlock(ctx, lock_state);
 			io_run_task_work();
-			mutex_lock(&ctx->uring_lock);
+			io_ring_ctx_lock(ctx, lock_state);
 		}
 		if (unlikely(task_sigpending(current)))
 			return -EINTR;
 		io_run_local_work_locked(ctx, nr_wait);
 
 		if (READ_ONCE(ctx->check_cq) & BIT(IO_CHECK_CQ_OVERFLOW_BIT))
-			io_cqring_overflow_flush_locked(ctx);
+			io_cqring_overflow_flush_locked(ctx, lock_state);
 	}
 
 	return 0;
@@ -74,6 +76,7 @@ static int __io_run_loop(struct io_ring_ctx *ctx)
 
 int io_run_loop(struct io_ring_ctx *ctx)
 {
+	struct io_ring_ctx_lock_state lock_state;
 	int ret;
 
 	ret = io_uring_add_tctx_node(ctx);
@@ -83,8 +86,8 @@ int io_run_loop(struct io_ring_ctx *ctx)
 	if (!io_allowed_run_tw(ctx))
 		return -EEXIST;
 
-	mutex_lock(&ctx->uring_lock);
-	ret = __io_run_loop(ctx);
-	mutex_unlock(&ctx->uring_lock);
+	io_ring_ctx_lock(ctx, &lock_state);
+	ret = __io_run_loop(ctx, &lock_state);
+	io_ring_ctx_unlock(ctx, &lock_state);
 	return ret;
 }
