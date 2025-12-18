@@ -2331,8 +2331,6 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 	mutex_unlock(&ctx->uring_lock);
 	if (ctx->sq_creds)
 		put_cred(ctx->sq_creds);
-	if (ctx->submitter_task)
-		put_task_struct(ctx->submitter_task);
 
 	WARN_ON_ONCE(!list_empty(&ctx->ltimeout_list));
 
@@ -2366,6 +2364,9 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
 	xa_destroy(&ctx->io_bl_xa);
 	xa_destroy(&ctx->hpage_acct);
 	xa_destroy(&ctx->personalities);
+	/* Release submitter_task last, as any io_ring_ctx_lock() may use it */
+	if (ctx->submitter_task)
+		put_task_struct(ctx->submitter_task);
 	kfree(ctx);
 }
 
@@ -3251,6 +3252,16 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 	if (!ctx)
 		return -ENOMEM;
 
+	/* Assign submitter_task first, as any io_ring_ctx_lock() may use it */
+	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER
+	    && !(ctx->flags & IORING_SETUP_R_DISABLED)) {
+		/*
+		 * Unlike io_register_enable_rings(), don't need WRITE_ONCE()
+		 * since ctx isn't yet accessible from other tasks
+		 */
+		ctx->submitter_task = get_task_struct(current);
+	}
+
 	ctx->clockid = CLOCK_MONOTONIC;
 	ctx->clock_offset = 0;
 
@@ -3326,10 +3337,6 @@ static __cold int io_uring_create(struct io_ctx_config *config)
 		ret = -EFAULT;
 		goto err;
 	}
-
-	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER
-	    && !(ctx->flags & IORING_SETUP_R_DISABLED))
-		ctx->submitter_task = get_task_struct(current);
 
 	file = io_uring_get_file(ctx);
 	if (IS_ERR(file)) {
