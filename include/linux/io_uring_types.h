@@ -4,9 +4,11 @@
 #include <linux/blk_plug.h>
 #include <linux/hashtable.h>
 #include <linux/task_work.h>
+#include <linux/thread_handoff.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
 #include <linux/uio.h>
+#include <linux/signal_types.h>
 #include <uapi/linux/io_uring.h>
 
 struct iou_loop_params;
@@ -139,12 +141,42 @@ struct io_br_sel {
  */
 #define IO_RINGFD_REG_MAX 16
 
+/* handoff state of a submitter that blocked inline, see io_uring/handoff.c */
+struct io_handoff {
+	/* the request being issued, while a handoff is possible */
+	struct io_kiocb			*req;
+	/* its ring and io-wq pool, @req is the demoted task's after that */
+	struct io_ring_ctx		*ctx;
+	bool				bound;
+	/* the submitter's signal mask while blocking issues run without */
+	sigset_t			sigmask;
+	bool				sigsaved;
+	/* the task the identity came from, and the task refs it held */
+	struct task_struct		*src;
+	unsigned int			src_refs;
+	struct thread_handoff_stats	stats;
+	/* io_uring_enter() arguments, to resume the syscall */
+	struct file			*file;
+	u32				to_submit;
+	/* SQEs consumed so far by this syscall, across handoffs */
+	u32				consumed;
+	u32				min_complete;
+	u32				flags;
+	const void __user		*argp;
+	size_t				argsz;
+};
+
 struct io_uring_task {
 	/* submission side */
 	int				cached_refs;
 	const struct io_ring_ctx 	*last;
 	struct task_struct		*task;
+	/* serializes ->task changes against off-task reference puts */
+	raw_spinlock_t			task_ref_lock;
 	struct io_wq			*io_wq;
+#ifdef CONFIG_THREAD_HANDOFF
+	struct io_handoff		handoff;
+#endif
 	/*
 	 * Consumer cursor for ->task_list. Only popped by the task itself,
 	 * or by ->fallback_work once the task can no longer run task_work.
@@ -298,6 +330,8 @@ struct io_submit_state {
 	bool			need_plug;
 	bool			cq_flush;
 	unsigned short		submit_nr;
+	/* cached SQ head at the start of the batch */
+	unsigned int		sq_head;
 	/* the submitting task's plug, lives on its stack */
 	struct blk_plug		*plug;
 };

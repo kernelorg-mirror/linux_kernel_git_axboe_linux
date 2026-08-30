@@ -10,6 +10,7 @@
 #include <uapi/linux/io_uring.h>
 
 #include "io_uring.h"
+#include "handoff.h"
 #include "tctx.h"
 #include "bpf_filter.h"
 
@@ -104,6 +105,7 @@ __cold struct io_uring_task *io_uring_alloc_task_context(struct task_struct *tas
 	}
 
 	tctx->task = task;
+	raw_spin_lock_init(&tctx->task_ref_lock);
 	xa_init(&tctx->xa);
 	INIT_LIST_HEAD(&tctx->node_list);
 	init_waitqueue_head(&tctx->wait);
@@ -175,8 +177,10 @@ int __io_uring_add_tctx_node(struct io_ring_ctx *ctx)
 	 * been marked for idle-exit when the task temporarily had no active
 	 * io_uring instances.
 	 */
-	if (tctx->io_wq)
+	if (tctx->io_wq) {
 		io_wq_set_exit_on_idle(tctx->io_wq, false);
+		io_handoff_prime(tctx, ctx);
+	}
 
 	if (new_tctx)
 		current->io_uring = tctx;
