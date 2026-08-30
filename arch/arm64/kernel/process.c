@@ -11,6 +11,7 @@
 #include <linux/elf.h>
 #include <linux/export.h>
 #include <linux/sched.h>
+#include <linux/thread_handoff.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
@@ -1003,3 +1004,104 @@ int set_tsc_mode(unsigned int val)
 
 	return do_set_tsc_mode(val);
 }
+
+#ifdef CONFIG_THREAD_HANDOFF
+/*
+ * Thread identity handoff, see include/linux/thread_handoff.h. The source
+ * is inside a syscall, so the ABI discards live SVE state and only the
+ * FPSIMD view of the vector registers needs to move; SME state is refused.
+ */
+bool arch_thread_handoff_allowed(struct task_struct *tsk)
+{
+	if (is_compat_thread(task_thread_info(tsk)))
+		return false;
+	/* the GCS is per-thread and the source's would have to move too */
+	if (task_gcs_el0_enabled(tsk))
+		return false;
+	if (test_tsk_thread_flag(tsk, TIF_TSC_SIGSEGV))
+		return false;
+	return true;
+}
+
+/*
+ * Runs on the source right before it blocks: sync the live user register
+ * state into the thread struct, nothing else ever will.
+ */
+bool arch_thread_handoff_prepare(void)
+{
+	struct thread_struct *thread = &current->thread;
+
+	fpsimd_preserve_current_state();
+	tls_preserve_current_state();
+	if (system_supports_poe())
+		thread->por_el0 = read_sysreg_s(SYS_POR_EL0);
+
+	/* ZA and streaming mode state doesn't move, for now */
+	if (thread_sm_enabled(thread) || thread_za_enabled(thread))
+		return false;
+	return true;
+}
+
+/*
+ * Runs on the destination task, in process context. Copy over the user
+ * register state, and load what the next return to userspace won't load
+ * by itself.
+ */
+int arch_thread_handoff_finish(struct task_struct *src)
+{
+	struct task_struct *dst = current;
+	struct pt_regs *regs = task_pt_regs(dst);
+	struct frame_record_meta stackframe = regs->stackframe;
+
+	/* the syscall frame, this is what the return to userspace restores */
+	*regs = *task_pt_regs(src);
+	regs->stackframe = stackframe;
+
+	preempt_disable();
+
+	dst->thread.uw = src->thread.uw;
+	dst->thread.fp_type = FP_STATE_FPSIMD;
+	memcpy(dst->thread.vl, src->thread.vl, sizeof(dst->thread.vl));
+	memcpy(dst->thread.vl_onexec, src->thread.vl_onexec,
+	       sizeof(dst->thread.vl_onexec));
+	dst->thread.svcr = src->thread.svcr;
+	dst->thread.tpidr2_el0 = src->thread.tpidr2_el0;
+	dst->thread.por_el0 = src->thread.por_el0;
+	dst->thread.sctlr_user = src->thread.sctlr_user;
+#ifdef CONFIG_ARM64_MTE
+	dst->thread.mte_ctrl = src->thread.mte_ctrl;
+#endif
+#ifdef CONFIG_ARM64_PTR_AUTH
+	dst->thread.keys_user = src->thread.keys_user;
+#endif
+	update_tsk_thread_flag(dst, TIF_SVE_VL_INHERIT,
+			       test_tsk_thread_flag(src, TIF_SVE_VL_INHERIT));
+	update_tsk_thread_flag(dst, TIF_SME_VL_INHERIT,
+			       test_tsk_thread_flag(src, TIF_SME_VL_INHERIT));
+	update_tsk_thread_flag(dst, TIF_TAGGED_ADDR,
+			       test_tsk_thread_flag(src, TIF_TAGGED_ADDR));
+	update_tsk_thread_flag(dst, TIF_SSBD,
+			       test_tsk_thread_flag(src, TIF_SSBD));
+	if (test_and_clear_tsk_thread_flag(src, TIF_MTE_ASYNC_FAULT))
+		set_tsk_thread_flag(dst, TIF_MTE_ASYNC_FAULT);
+
+	/*
+	 * Load what __switch_to() would have loaded. The FPSIMD state gets
+	 * restored on the way out to userspace, it just needs to be marked
+	 * as not being what the CPU currently holds.
+	 */
+	write_sysreg(dst->thread.uw.tp_value, tpidr_el0);
+	if (system_supports_tpidr2())
+		write_sysreg_s(dst->thread.tpidr2_el0, SYS_TPIDR2_EL0);
+	if (system_supports_poe())
+		write_sysreg_s(dst->thread.por_el0, SYS_POR_EL0);
+	contextidr_thread_switch(dst);
+	ptrauth_thread_switch_user(dst);
+	mte_thread_switch(dst);
+	update_sctlr_el1(dst->thread.sctlr_user);
+	fpsimd_flush_task_state(dst);
+
+	preempt_enable();
+	return 0;
+}
+#endif
