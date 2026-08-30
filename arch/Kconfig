@@ -596,6 +596,19 @@ config ARCH_HAVE_EXTRA_ELF_NOTES
 config ARCH_HAS_NMI_SAFE_THIS_CPU_OPS
 	bool
 
+config ARCH_HAS_THREAD_HANDOFF
+	bool
+	help
+	  Architecture provides the arch_thread_handoff_*() hooks for moving
+	  the user visible register state of a thread that is blocked in the
+	  kernel to another thread of the same process. A port must
+	  implement all four hooks, guard their definitions with
+	  CONFIG_THREAD_HANDOFF, and refuse state that cannot move
+	  (32-bit/compat tasks, dynamic or non-default sized FPU state,
+	  SME/ZA and similar vector state, and shadow-stack/GCS state
+	  unless the port swaps it in _finish()). See
+	  include/linux/thread_handoff.h for the hook contract.
+
 config HAVE_ALIGNED_STRUCT_PAGE
 	bool
 	help

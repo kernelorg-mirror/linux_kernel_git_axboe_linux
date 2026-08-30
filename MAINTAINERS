@@ -14048,10 +14048,12 @@ T:	git git://git.kernel.org/pub/scm/linux/kernel/git/axboe/liburing.git
 F:	include/linux/io_uring/
 F:	include/linux/io_uring.h
 F:	include/linux/io_uring_types.h
+F:	include/linux/thread_handoff.h
 F:	include/trace/events/io_uring.h
 F:	include/uapi/linux/io_uring.h
 F:	include/uapi/linux/io_uring/
 F:	io_uring/
+F:	kernel/thread_handoff.c
 
 IO_URING ZCRX
 M:	Pavel Begunkov <asml.silence@gmail.com>

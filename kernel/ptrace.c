@@ -431,7 +431,7 @@ static inline void ptrace_set_stopped(struct task_struct *task, bool seize)
 	}
 }
 
-static int ptrace_attach(struct task_struct *task, long request,
+static int ptrace_attach(struct task_struct *task, pid_t pid, long request,
 			 unsigned long addr,
 			 unsigned long flags)
 {
@@ -479,12 +479,31 @@ static int ptrace_attach(struct task_struct *task, long request,
 		}
 
 		scoped_guard (write_lock_irq, &tasklist_lock) {
+			/*
+			 * A thread identity handoff moves the tids of its two
+			 * tasks under tasklist_lock, @task was looked up without
+			 * it. Start over with the task that holds @pid now.
+			 */
+			if (unlikely(task_pid_vnr(task) != pid))
+				return restart_syscall();
 			if (unlikely(task->exit_state))
 				return -EPERM;
 			if (task->ptrace)
 				return -EPERM;
 
 			task->ptrace = flags;
+			/*
+			 * A thread identity handoff in flight marks both of
+			 * its tasks, the tid attached to here would move to
+			 * the other one. The mark is set without tasklist_lock
+			 * and ->ptrace checked after it, see
+			 * thread_handoff_mark(), so check it after the store.
+			 */
+			smp_mb();
+			if (unlikely(task_thread_handoff(task))) {
+				task->ptrace = 0;
+				return -EPERM;
+			}
 			ptrace_link(task, current);
 			ptrace_set_stopped(task, seize);
 		}
@@ -1431,7 +1450,7 @@ SYSCALL_DEFINE4(ptrace, long, request, long, pid, unsigned long, addr,
 	}
 
 	if (request == PTRACE_ATTACH || request == PTRACE_SEIZE) {
-		ret = ptrace_attach(child, request, addr, data);
+		ret = ptrace_attach(child, pid, request, addr, data);
 		goto out_put_task_struct;
 	}
 
@@ -1567,7 +1586,7 @@ COMPAT_SYSCALL_DEFINE4(ptrace, compat_long_t, request, compat_long_t, pid,
 	}
 
 	if (request == PTRACE_ATTACH || request == PTRACE_SEIZE) {
-		ret = ptrace_attach(child, request, addr, data);
+		ret = ptrace_attach(child, pid, request, addr, data);
 		goto out_put_task_struct;
 	}
 
