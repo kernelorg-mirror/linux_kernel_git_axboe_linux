@@ -2688,11 +2688,12 @@ struct task_struct * __init fork_idle(int cpu)
  * creating io_uring workers. It returns a created task, or an error pointer.
  * The returned task is inactive, and the caller must fire it up through
  * wake_up_new_task(p). All signals are blocked in the created task.
+ * CLONE_SYSVSEM as a worker may take over a user thread's identity.
  */
 struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
 {
 	unsigned long flags = CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|
-			      CLONE_IO|CLONE_VM|CLONE_UNTRACED;
+			      CLONE_IO|CLONE_VM|CLONE_UNTRACED|CLONE_SYSVSEM;
 	struct kernel_clone_args args = {
 		.flags		= flags,
 		.fn		= fn,
