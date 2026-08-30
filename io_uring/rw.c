@@ -134,7 +134,7 @@ static bool io_rw_recycle(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_async_rw *rw = req->async_data;
 
-	if (unlikely(issue_flags & IO_URING_F_UNLOCKED))
+	if (unlikely(io_issue_needs_lock(issue_flags)))
 		return false;
 
 	io_alloc_cache_vec_kasan(&rw->vec);
