@@ -426,6 +426,16 @@ static inline bool io_issue_needs_lock(unsigned int issue_flags)
 		io_issue_handed_off(issue_flags);
 }
 
+/*
+ * A blocking issue interrupted by a signal or task_work notification
+ * returns one of these; retry on io-wq instead of restarting a syscall.
+ */
+static inline bool io_issue_wants_restart(int ret)
+{
+	return ret == -ERESTARTSYS || ret == -ERESTARTNOINTR ||
+	       ret == -ERESTARTNOHAND || ret == -ERESTART_RESTARTBLOCK;
+}
+
 static inline void io_ring_submit_unlock(struct io_ring_ctx *ctx,
 					 unsigned issue_flags)
 {

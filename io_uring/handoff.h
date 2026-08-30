@@ -6,19 +6,10 @@
 #include "opdef.h"
 #include "tw.h"
 
-/*
- * A blocking issue that got interrupted by a signal or a task_work
- * notification returns one of these, the kernel would restart a syscall.
- */
-static inline bool io_issue_wants_restart(int ret)
-{
-	return ret == -ERESTARTSYS || ret == -ERESTARTNOINTR ||
-	       ret == -ERESTARTNOHAND || ret == -ERESTART_RESTARTBLOCK;
-}
-
 #ifdef CONFIG_THREAD_HANDOFF
 extern int sysctl_io_uring_handoff;
 
+bool io_handoff_possible(struct io_kiocb *req);
 bool __io_handoff_begin(struct io_kiocb *req);
 void io_handoff_prime(struct io_uring_task *tctx, struct io_ring_ctx *ctx);
 bool io_handoff_end(void);
@@ -65,6 +56,10 @@ static inline void io_handoff_enter(struct file *file, u32 to_submit,
 static inline bool io_handoff_begin(struct io_kiocb *req,
 				    const struct io_issue_def *def,
 				    unsigned int issue_flags)
+{
+	return false;
+}
+static inline bool io_handoff_possible(struct io_kiocb *req)
 {
 	return false;
 }

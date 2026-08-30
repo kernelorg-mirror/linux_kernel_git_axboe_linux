@@ -1424,10 +1424,21 @@ static int io_issue_sqe(struct io_kiocb *req, unsigned int issue_flags)
 	if (unlikely(!io_assign_file(req, def, issue_flags)))
 		return -EBADF;
 
+	/*
+	 * With a handoff armed there's no point trying nonblocking first,
+	 * and inline FORCE_ASYNC requests can't do nonblocking at all.
+	 */
 	handoff = io_handoff_begin(req, def, issue_flags);
+	if (handoff || ((issue_flags & IO_URING_F_INLINE) &&
+			(req->flags & REQ_F_FORCE_ASYNC)))
+		issue_flags &= ~IO_URING_F_NONBLOCK;
 	ret = __io_issue_sqe(req, issue_flags, def);
 	if (handoff && unlikely(io_handoff_end()))
 		return io_handoff_complete(req, ret);
+	/* a blocking issue got interrupted, have io-wq retry it */
+	if (unlikely(io_issue_wants_restart(ret)) &&
+	    !(issue_flags & IO_URING_F_NONBLOCK))
+		return -EAGAIN;
 
 	if (ret == IOU_COMPLETE) {
 		if (issue_flags & IO_URING_F_COMPLETE_DEFER)
@@ -1759,6 +1770,8 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	/* same numerical values with corresponding REQ_F_*, safe to copy */
 	sqe_flags = READ_ONCE(sqe->flags);
 	req->flags = (__force io_req_flags_t) sqe_flags;
+	if (sqe_flags & IOSQE_ASYNC)
+		req->flags |= REQ_F_ASYNC_USER;
 	req->cqe.user_data = READ_ONCE(sqe->user_data);
 	req->file = NULL;
 	req->tctx = current->io_uring;
@@ -1898,6 +1911,28 @@ static __cold int io_submit_fail_init(const struct io_uring_sqe *sqe,
 	return 0;
 }
 
+/*
+ * Force-async requests aren't meant to block the submitter. A blockable
+ * one issued inline with a handoff armed beats an up-front io-wq punt.
+ */
+static bool io_req_force_async(struct io_kiocb *req)
+{
+	if (req->flags & REQ_F_FAIL)
+		return true;
+	if (!(req->flags & REQ_F_FORCE_ASYNC))
+		return false;
+	/* userspace asked for it, keep the explicit offload */
+	if (req->flags & REQ_F_ASYNC_USER)
+		return true;
+	if (req->ctx->int_flags & IO_RING_F_DRAIN_ACTIVE)
+		return true;
+	/* the file decides on pollability, resolve it now if fixed */
+	if (!io_assign_file(req, &io_issue_defs[req->opcode],
+			    IO_URING_F_INLINE))
+		return true;
+	return !io_handoff_possible(req);
+}
+
 static inline int io_submit_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
 			 const struct io_uring_sqe *sqe, unsigned int *left)
 	__must_hold(&ctx->uring_lock)
@@ -1935,7 +1970,7 @@ static inline int io_submit_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
 		/* last request of the link, flush it */
 		req = link->head;
 		link->head = NULL;
-		if (req->flags & (REQ_F_FORCE_ASYNC | REQ_F_FAIL))
+		if (io_req_force_async(req))
 			goto fallback;
 
 	} else if (unlikely(req->flags & (IO_REQ_LINK_FLAGS |
@@ -1943,11 +1978,13 @@ static inline int io_submit_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
 		if (req->flags & IO_REQ_LINK_FLAGS) {
 			link->head = req;
 			link->last = req;
-		} else {
+			return 0;
+		}
+		if (io_req_force_async(req)) {
 fallback:
 			io_queue_sqe_fallback(req);
+			return 0;
 		}
-		return 0;
 	}
 
 	return io_queue_sqe(req, IO_URING_F_INLINE);

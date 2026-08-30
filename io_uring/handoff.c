@@ -32,15 +32,19 @@ int sysctl_io_uring_handoff __read_mostly = 1;
 static long io_handoff_resume(void);
 
 /*
- * Check that @req and the task qualify, and if so mark the task for a
- * handoff if the inline issue blocks.
+ * Check if @req can be issued inline in blocking mode with a handoff
+ * ready for if it blocks. If not, the request falls back to the classic
+ * nonblocking issue + io-wq punt.
  */
-bool __io_handoff_begin(struct io_kiocb *req)
+bool io_handoff_possible(struct io_kiocb *req)
 {
+	const struct io_issue_def *def = &io_issue_defs[req->opcode];
 	struct io_ring_ctx *ctx = req->ctx;
 	struct io_uring_task *tctx = current->io_uring;
 
 	if (!sysctl_io_uring_handoff)
+		return false;
+	if (!def->blockable)
 		return false;
 	/* nonblocking semantics were asked for, -EAGAIN is the answer */
 	if (req->flags & REQ_F_NOWAIT)
@@ -50,6 +54,16 @@ bool __io_handoff_begin(struct io_kiocb *req)
 	/* pollable files keep the nonblocking issue + poll retry path */
 	if (io_file_can_poll(req))
 		return false;
+	/*
+	 * Reads and writes on a file with FMODE_NOWAIT have a working
+	 * nonblocking path (inline completion, IOCB_WAITQ retry, or a
+	 * punt); a blocking issue with an identity swap per op would be
+	 * worse. Handoff is for requests whose only alternative is an
+	 * up-front punt.
+	 */
+	if ((def->pollin || def->pollout) && req->file &&
+	    (req->file->f_mode & FMODE_NOWAIT))
+		return false;
 	if (!tctx->io_wq)
 		return false;
 	if (!thread_handoff_allowed(current))
@@ -58,10 +72,16 @@ bool __io_handoff_begin(struct io_kiocb *req)
 	if (io_req_sqe_copy(req, IO_URING_F_INLINE))
 		return false;
 	/* have a worker ready to take over */
-	if (!io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false))
+	return io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false);
+}
+
+/* Mark the task for a handoff if the inline issue of @req blocks */
+bool __io_handoff_begin(struct io_kiocb *req)
+{
+	if (!io_handoff_possible(req))
 		return false;
 
-	tctx->handoff.req = req;
+	current->io_uring->handoff.req = req;
 	current->flags |= PF_IO_HANDOFF;
 	return true;
 }
