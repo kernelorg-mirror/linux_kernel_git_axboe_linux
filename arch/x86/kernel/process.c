@@ -155,13 +155,14 @@ __visible void ret_from_fork(struct task_struct *prev, struct pt_regs *regs,
 
 	/* Is this a kernel thread? */
 	if (unlikely(fn)) {
-		fn(fn_arg);
+		long ret = fn(fn_arg);
+
 		/*
-		 * A kernel thread is allowed to return here after successfully
-		 * calling kernel_execve().  Exit to userspace to complete the
-		 * execve() syscall.
+		 * A kernel thread returning from kernel_execve(), or an io-wq
+		 * worker that got handed a user identity returning the result
+		 * of the syscall it took over.
 		 */
-		regs->ax = 0;
+		regs->ax = ret;
 	}
 
 	syscall_exit_to_user_mode(regs);

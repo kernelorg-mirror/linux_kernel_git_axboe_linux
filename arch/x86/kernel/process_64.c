@@ -41,6 +41,7 @@
 #include <linux/ftrace.h>
 #include <linux/syscalls.h>
 #include <linux/iommu.h>
+#include <linux/thread_handoff.h>
 
 #include <asm/processor.h>
 #include <asm/pkru.h>
@@ -980,3 +981,122 @@ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
 
 	return ret;
 }
+
+#ifdef CONFIG_THREAD_HANDOFF
+/*
+ * Thread identity handoff, see include/linux/thread_handoff.h. The source
+ * is inside a syscall and never returns to userspace itself, so its user
+ * register state is final once synced to the task struct.
+ */
+bool arch_thread_handoff_allowed(struct task_struct *tsk)
+{
+	struct thread_struct *t = &tsk->thread;
+
+	/* 64-bit tasks only */
+	if (test_tsk_thread_flag(tsk, TIF_ADDR32))
+		return false;
+	/* I/O permissions are bound to the task */
+	if (test_tsk_thread_flag(tsk, TIF_IO_BITMAP) || t->iopl_emul)
+		return false;
+	/* per-thread speculation and CPUID/TSC controls, all prctl driven */
+	if (test_tsk_thread_flag(tsk, TIF_SSBD) ||
+	    test_tsk_thread_flag(tsk, TIF_SPEC_IB) ||
+	    test_tsk_thread_flag(tsk, TIF_NOCPUID) ||
+	    test_tsk_thread_flag(tsk, TIF_NOTSC))
+		return false;
+#ifdef CONFIG_X86_USER_SHADOW_STACK
+	/* the shadow stack is per-thread and would have to move along */
+	if (t->features & ARCH_SHSTK_SHSTK)
+		return false;
+#endif
+	/* only the default sized FPU state gets copied over, no AMX */
+	if (x86_task_fpu(tsk)->fpstate->is_valloc)
+		return false;
+	return true;
+}
+
+/*
+ * Runs on the source right before it blocks: sync the live user register
+ * state into the task struct, nothing else ever will.
+ */
+bool arch_thread_handoff_prepare(void)
+{
+	current_save_fsgs();
+	/* thread.pkru is only valid when scheduled out, make it so */
+	if (cpu_feature_enabled(X86_FEATURE_OSPKE))
+		current->thread.pkru = read_pkru();
+	fpu_sync_fpstate(x86_task_fpu(current));
+	return true;
+}
+
+/*
+ * Runs on the destination task, in process context. Copy the user register
+ * state over, and load what the next return to userspace won't load by
+ * itself, the way __switch_to() would have.
+ */
+int arch_thread_handoff_finish(struct task_struct *src)
+{
+	struct task_struct *dst = current;
+	struct thread_struct *t = &dst->thread, *s = &src->thread;
+	struct fpu *dst_fpu = x86_task_fpu(dst), *src_fpu = x86_task_fpu(src);
+	struct thread_struct prev;
+
+	/* the syscall frame, this is what the return to userspace restores */
+	*task_pt_regs(dst) = *task_pt_regs(src);
+
+	/* fault info, in case a signal for it is pending */
+	t->cr2 = s->cr2;
+	t->trap_nr = s->trap_nr;
+	t->error_code = s->error_code;
+
+	/*
+	 * Both sides have the default sized fpstate, copy the register image
+	 * over and make sure it gets loaded on the way out to userspace.
+	 */
+	fpregs_lock();
+	memcpy(&dst_fpu->fpstate->regs, &src_fpu->fpstate->regs,
+	       src_fpu->fpstate->size);
+	dst_fpu->last_cpu = -1;
+	set_thread_flag(TIF_NEED_FPU_LOAD);
+	fpregs_unlock();
+
+	preempt_disable();
+
+	memcpy(t->tls_array, s->tls_array, sizeof(t->tls_array));
+	load_TLS(t, smp_processor_id());
+
+	savesegment(es, t->es);
+	if (unlikely(t->es | s->es))
+		loadsegment(es, s->es);
+	t->es = s->es;
+	savesegment(ds, t->ds);
+	if (unlikely(t->ds | s->ds))
+		loadsegment(ds, s->ds);
+	t->ds = s->ds;
+
+	/*
+	 * The FS/GS selectors and bases. Grab what the CPU currently holds
+	 * for us first, the legacy load path needs to know that.
+	 */
+	local_irq_disable();
+	save_fsgs(dst);
+	prev.fsindex = t->fsindex;
+	prev.fsbase = t->fsbase;
+	prev.gsindex = t->gsindex;
+	prev.gsbase = t->gsbase;
+	t->fsindex = s->fsindex;
+	t->fsbase = s->fsbase;
+	t->gsindex = s->gsindex;
+	t->gsbase = s->gsbase;
+	x86_fsgsbase_load(&prev, t);
+	local_irq_enable();
+
+	if (cpu_feature_enabled(X86_FEATURE_OSPKE)) {
+		t->pkru = s->pkru;
+		write_pkru(t->pkru);
+	}
+
+	preempt_enable();
+	return 0;
+}
+#endif
