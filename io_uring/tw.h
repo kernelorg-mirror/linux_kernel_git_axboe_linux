@@ -34,6 +34,7 @@ __cold void io_cancel_local_task_work(struct io_ring_ctx *ctx);
 int io_run_local_work_locked(struct io_ring_ctx *ctx, int min_events);
 
 void io_req_local_work_add(struct io_kiocb *req, unsigned flags);
+void io_fallback_tw(struct io_uring_task *tctx);
 void io_req_normal_work_add(struct io_kiocb *req);
 void tctx_task_work_run(struct io_uring_task *tctx, unsigned int max_entries, unsigned int *count);
 

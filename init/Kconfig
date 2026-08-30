@@ -1772,7 +1772,11 @@ config THREAD_HANDOFF
 	  about to block in the kernel to another thread of the same process,
 	  which then returns to userspace on its behalf. Used by io_uring to
 	  issue requests inline and only offload them to a worker thread if
-	  they actually block.
+	  they actually block. The runtime behaviour is controlled by the
+	  kernel.io_uring_handoff sysctl (0=off, 1=identity handoff,
+	  2=synchronous worker issue), which is absent without arch
+	  support; a ring created with IORING_SETUP_NO_HANDOFF never
+	  hands off, whatever the sysctl says.
 
 config IO_URING
 	bool "Enable IO uring support" if EXPERT

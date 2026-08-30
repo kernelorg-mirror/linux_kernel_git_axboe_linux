@@ -253,6 +253,14 @@ enum io_uring_sqe_flags_bit {
  */
 #define IORING_SETUP_SQ_REWIND		(1U << 20)
 
+/*
+ * Do not hand the submitter's thread identity to an io-wq worker when a
+ * blockable request blocks inline, and do not use the synchronous worker
+ * mode either. Requests still issue inline nonblocking, and blockable
+ * requests that cannot complete that way are punted to io-wq as before.
+ */
+#define IORING_SETUP_NO_HANDOFF		(1U << 21)
+
 enum io_uring_op {
 	IORING_OP_NOP,
 	IORING_OP_READV,

@@ -523,6 +523,28 @@ default), only processes with the CAP_SYS_ADMIN capability may create
 io_uring instances.
 
 
+io_uring_handoff
+================
+
+Controls what happens when a blockable io_uring request issued inline
+blocks in the kernel. This entry only exists on architectures with
+thread-identity handoff support (x86_64 and arm64) and only when
+CONFIG_THREAD_HANDOFF is enabled. Changing it only affects issues
+that have not yet blocked; a ring created with
+IORING_SETUP_NO_HANDOFF never hands off, whatever this value is.
+
+= ======================================================================
+0 Handoff is off. Blockable requests that cannot complete inline
+  are punted to io-wq as before.
+1 Identity handoff (the default). The submitter's user-visible
+  identity moves to an idle io-wq worker, which finishes the
+  submission and returns to userspace, while the submitter
+  completes the request as a worker.
+2 Synchronous worker issue. An idle worker runs the request right
+  away while the submitter waits for it to finish or block.
+= ======================================================================
+
+
 kernel_sys_info
 ===============
 A comma separated list of extra system information to be dumped when
