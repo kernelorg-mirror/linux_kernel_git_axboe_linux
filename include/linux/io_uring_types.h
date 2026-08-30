@@ -298,7 +298,8 @@ struct io_submit_state {
 	bool			need_plug;
 	bool			cq_flush;
 	unsigned short		submit_nr;
-	struct blk_plug		plug;
+	/* the submitting task's plug, lives on its stack */
+	struct blk_plug		*plug;
 };
 
 struct io_alloc_cache {
