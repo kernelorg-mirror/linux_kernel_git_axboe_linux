@@ -29,6 +29,8 @@ struct io_issue_def {
 	unsigned		vectored : 1;
 	/* set to 1 if this opcode uses 128b sqes in a mixed sq */
 	unsigned		is_128 : 1;
+	/* issue path is safe to run inline in blocking mode */
+	unsigned		blockable : 1;
 
 	/* size of async data needed, if any */
 	unsigned short		async_size;
