@@ -98,6 +98,7 @@
 #include "wait.h"
 #include "bpf_filter.h"
 #include "loop.h"
+#include "handoff.h"
 
 #define SQE_COMMON_FLAGS (IOSQE_FIXED_FILE | IOSQE_IO_LINK | \
 			  IOSQE_IO_HARDLINK | IOSQE_ASYNC)
@@ -119,7 +120,7 @@
 /* requests with any of those set should undergo io_disarm_next() */
 #define IO_DISARM_MASK (REQ_F_ARM_LTIMEOUT | REQ_F_LINK_TIMEOUT | REQ_F_FAIL)
 
-static void io_queue_sqe(struct io_kiocb *req, unsigned int extra_flags);
+static int io_queue_sqe(struct io_kiocb *req, unsigned int extra_flags);
 static void __io_req_caches_free(struct io_ring_ctx *ctx);
 
 static __read_mostly DEFINE_STATIC_KEY_DEFERRED_FALSE(io_key_has_sqarray, HZ);
@@ -132,6 +133,17 @@ static int __read_mostly sysctl_io_uring_group = -1;
 
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table kernel_io_uring_disabled_table[] = {
+#ifdef CONFIG_THREAD_HANDOFF
+	{
+		.procname	= "io_uring_handoff",
+		.data		= &sysctl_io_uring_handoff,
+		.maxlen		= sizeof(sysctl_io_uring_handoff),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+#endif
 	{
 		.procname	= "io_uring_disabled",
 		.data		= &sysctl_io_uring_disabled,
@@ -384,9 +396,8 @@ static void io_prep_async_work(struct io_kiocb *req)
 			should_hash = false;
 		if (should_hash || (req->flags & REQ_F_IOPOLL))
 			io_wq_hash_work(&req->work, file_inode(req->file));
-	} else if (!req->file || !S_ISBLK(file_inode(req->file)->i_mode)) {
-		if (def->unbound_nonreg_file)
-			atomic_or(IO_WQ_WORK_UNBOUND, &req->work.flags);
+	} else if (io_req_unbound(req)) {
+		atomic_or(IO_WQ_WORK_UNBOUND, &req->work.flags);
 	}
 }
 
@@ -595,10 +606,16 @@ static inline void io_put_task(struct io_kiocb *req)
 	if (likely(tctx->task == current)) {
 		tctx->cached_refs++;
 	} else {
+		struct task_struct *task;
+
+		/* ->task can change under us, see io_handoff_task_refs() */
+		raw_spin_lock(&tctx->task_ref_lock);
 		percpu_counter_sub(&tctx->inflight, 1);
+		task = tctx->task;
+		raw_spin_unlock(&tctx->task_ref_lock);
 		if (unlikely(atomic_read(&tctx->in_cancel)))
 			wake_up(&tctx->wait);
-		put_task_struct(tctx->task);
+		put_task_struct(task);
 	}
 }
 
@@ -1401,12 +1418,16 @@ static inline int __io_issue_sqe(struct io_kiocb *req,
 static int io_issue_sqe(struct io_kiocb *req, unsigned int issue_flags)
 {
 	const struct io_issue_def *def = &io_issue_defs[req->opcode];
+	bool handoff;
 	int ret;
 
 	if (unlikely(!io_assign_file(req, def, issue_flags)))
 		return -EBADF;
 
+	handoff = io_handoff_begin(req, def, issue_flags);
 	ret = __io_issue_sqe(req, issue_flags, def);
+	if (handoff && unlikely(io_handoff_end()))
+		return io_handoff_complete(req, ret);
 
 	if (ret == IOU_COMPLETE) {
 		if (issue_flags & IO_URING_F_COMPLETE_DEFER)
@@ -1590,7 +1611,7 @@ struct file *io_file_get_normal(struct io_kiocb *req, int fd)
 	return file;
 }
 
-static int io_req_sqe_copy(struct io_kiocb *req, unsigned int issue_flags)
+int io_req_sqe_copy(struct io_kiocb *req, unsigned int issue_flags)
 {
 	const struct io_cold_def *def = &io_cold_defs[req->opcode];
 
@@ -1630,7 +1651,8 @@ fail:
 	}
 }
 
-static inline void io_queue_sqe(struct io_kiocb *req, unsigned int extra_flags)
+/* returns -EIOCBQUEUED if the identity got handed off, we're a worker now */
+static inline int io_queue_sqe(struct io_kiocb *req, unsigned int extra_flags)
 	__must_hold(&req->ctx->uring_lock)
 {
 	unsigned int issue_flags = IO_URING_F_NONBLOCK |
@@ -1638,6 +1660,8 @@ static inline void io_queue_sqe(struct io_kiocb *req, unsigned int extra_flags)
 	int ret;
 
 	ret = io_issue_sqe(req, issue_flags);
+	if (unlikely(ret == -EIOCBQUEUED))
+		return ret;
 
 	/*
 	 * We async punt it if the file wasn't marked NOWAIT, or if the file
@@ -1645,6 +1669,7 @@ static inline void io_queue_sqe(struct io_kiocb *req, unsigned int extra_flags)
 	 */
 	if (unlikely(ret))
 		io_queue_async(req, issue_flags, ret);
+	return 0;
 }
 
 static void io_queue_sqe_fallback(struct io_kiocb *req)
@@ -1922,8 +1947,7 @@ fallback:
 		return 0;
 	}
 
-	io_queue_sqe(req, IO_URING_F_INLINE);
-	return 0;
+	return io_queue_sqe(req, IO_URING_F_INLINE);
 }
 
 /*
@@ -2033,6 +2057,25 @@ static int io_submit_sqes_end(struct io_ring_ctx *ctx, unsigned int entries,
 	return ret;
 }
 
+#ifdef CONFIG_THREAD_HANDOFF
+/*
+ * The submitter blocked mid-batch, return the task refs for what it won't
+ * submit and publish the SQ head. Returns the number of entries consumed.
+ */
+unsigned int io_submit_sqes_abandon(struct io_ring_ctx *ctx)
+	__must_hold(&ctx->uring_lock)
+{
+	struct io_submit_state *state = &ctx->submit_state;
+	unsigned int consumed = ctx->cached_sq_head - state->sq_head;
+
+	WARN_ON_ONCE(state->link.head);
+	current->io_uring->cached_refs += state->submit_nr - consumed;
+	state->plug_started = false;
+	io_commit_sqring(ctx);
+	return consumed;
+}
+#endif
+
 int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 	__must_hold(&ctx->uring_lock)
 {
@@ -2052,10 +2095,12 @@ int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 	left = entries;
 	io_get_task_refs(left);
 	io_submit_state_start(&ctx->submit_state, &plug, left);
+	ctx->submit_state.sq_head = ctx->cached_sq_head;
 
 	do {
 		const struct io_uring_sqe *sqe;
 		struct io_kiocb *req;
+		int ret;
 
 		if (unlikely(!io_alloc_req(ctx, &req)))
 			break;
@@ -2064,17 +2109,24 @@ int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 			break;
 		}
 
+		ret = io_submit_sqe(ctx, req, sqe, &left);
+		/* handed off, the promoted task finishes the batch */
+		if (unlikely(ret == -EIOCBQUEUED)) {
+			if (current->plug == &plug)
+				blk_finish_plug(&plug);
+			return ret;
+		}
 		/*
 		 * Continue submitting even for sqe failure if the
 		 * ring was setup with IORING_SETUP_SUBMIT_ALL
 		 */
-		if (unlikely(io_submit_sqe(ctx, req, sqe, &left)) &&
-		    !(ctx->flags & IORING_SETUP_SUBMIT_ALL)) {
+		if (unlikely(ret) && !(ctx->flags & IORING_SETUP_SUBMIT_ALL)) {
 			left--;
 			break;
 		}
 	} while (--left);
 
+	io_handoff_submit_end();
 	return io_submit_sqes_end(ctx, entries, left);
 }
 
@@ -2656,7 +2708,7 @@ static int io_uring_getevents(struct io_ring_ctx *ctx, int ret,
 }
 
 /* Finish an io_uring_enter() call that submitted and holds the uring_lock */
-static int io_uring_enter_finish(struct io_ring_ctx *ctx, int ret, u32 min_complete,
+int io_uring_enter_finish(struct io_ring_ctx *ctx, int ret, u32 min_complete,
 			  u32 flags, const void __user *argp, size_t argsz)
 {
 	int ret2;
@@ -2733,8 +2785,13 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		if (unlikely(ret))
 			goto out;
 
+		io_handoff_enter(file, to_submit, min_complete, flags, argp,
+				 argsz);
 		mutex_lock(&ctx->uring_lock);
 		ret = io_submit_sqes(ctx, to_submit);
+		/* handed off, the promoted task finishes the syscall */
+		if (unlikely(ret == -EIOCBQUEUED))
+			return io_uring_handoff_worker();
 		if (ret != to_submit) {
 			mutex_unlock(&ctx->uring_lock);
 			goto out;
