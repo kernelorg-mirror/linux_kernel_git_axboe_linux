@@ -1823,7 +1823,7 @@ extern struct pid __rcu *cad_pid;
 #define PF_KTHREAD		0x00200000	/* I am a kernel thread */
 #define PF_RANDOMIZE		0x00400000	/* Randomize virtual address space */
 #define PF_NO_NOTIFY_SIGNAL	0x00800000	/* see no_notify_signal_save() */
-#define PF__HOLE__01000000	0x01000000
+#define PF_IO_HANDOFF		0x01000000	/* io_uring: hand identity off if the task blocks */
 #define PF__HOLE__02000000	0x02000000
 #define PF_NO_SETAFFINITY	0x04000000	/* Userland is not allowed to meddle with cpus_mask */
 #define PF_MCE_EARLY		0x08000000      /* Early kill for mce process policy */
