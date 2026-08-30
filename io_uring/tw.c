@@ -9,6 +9,7 @@
 #include <linux/indirect_call_wrapper.h>
 
 #include "io_uring.h"
+#include "handoff.h"
 #include "tctx.h"
 #include "poll.h"
 #include "rw.h"
@@ -130,6 +131,10 @@ void tctx_task_work(struct callback_head *cb)
 	unsigned int count = 0;
 
 	tctx = container_of(cb, struct io_uring_task, task_work);
+	/* the tctx may have moved while queued, run it there if so */
+	if (unlikely(READ_ONCE(tctx->task) != current) &&
+	    !task_work_add(tctx->task, cb, TWA_SIGNAL))
+		return;
 	tctx_task_work_run(tctx, UINT_MAX, &count);
 }
 
@@ -209,6 +214,7 @@ void io_req_normal_work_add(struct io_kiocb *req)
 {
 	struct io_uring_task *tctx = req->tctx;
 	struct io_ring_ctx *ctx = req->ctx;
+	struct task_struct *task;
 
 	/* tw run already pending, nothing else to do */
 	if (!mpscq_push(&tctx->task_list, &req->io_task_work.node))
@@ -227,8 +233,14 @@ void io_req_normal_work_add(struct io_kiocb *req)
 		return;
 	}
 
-	if (likely(!task_work_add(tctx->task, &tctx->task_work, ctx->notify_method)))
+	task = READ_ONCE(tctx->task);
+	if (likely(!io_wq_task_work_add(task, &tctx->task_work,
+					 ctx->notify_method))) {
+		/* the tctx moved while we were adding, move the work along */
+		if (unlikely(READ_ONCE(tctx->task) != task))
+			io_handoff_tw_moved(tctx, task);
 		return;
+	}
 
 	io_fallback_tw(tctx);
 }

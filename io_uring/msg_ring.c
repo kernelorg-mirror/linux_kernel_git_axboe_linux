@@ -245,7 +245,7 @@ static int io_msg_fd_remote(struct io_kiocb *req)
 	struct task_struct *task = ctx->submitter_task;
 
 	init_task_work(&msg->tw, io_msg_tw_fd_complete);
-	if (task_work_add(task, &msg->tw, TWA_SIGNAL))
+	if (io_wq_task_work_add(task, &msg->tw, TWA_SIGNAL))
 		return -EOWNERDEAD;
 
 	return IOU_ISSUE_SKIP_COMPLETE;
