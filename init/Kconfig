@@ -1957,9 +1957,20 @@ config AIO
 	  by some high performance threaded applications. Disabling
 	  this option saves about 7k.
 
+config THREAD_HANDOFF
+	bool
+	depends on ARCH_HAS_THREAD_HANDOFF
+	help
+	  Support for handing the user visible identity of a thread that is
+	  about to block in the kernel to another thread of the same process,
+	  which then returns to userspace on its behalf. Used by io_uring to
+	  issue requests inline and only offload them to a worker thread if
+	  they actually block.
+
 config IO_URING
 	bool "Enable IO uring support" if EXPERT
 	select IO_WQ
+	select THREAD_HANDOFF if ARCH_HAS_THREAD_HANDOFF
 	default y
 	help
 	  This option enables support for the io_uring interface, enabling
