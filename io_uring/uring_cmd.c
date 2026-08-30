@@ -28,7 +28,7 @@ static void io_req_uring_cleanup(struct io_kiocb *req, unsigned int issue_flags)
 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
 	struct io_async_cmd *ac = req->async_data;
 
-	if (issue_flags & IO_URING_F_UNLOCKED)
+	if (io_issue_needs_lock(issue_flags))
 		return;
 
 	io_alloc_cache_vec_kasan(&ac->vec);
@@ -172,7 +172,8 @@ void __io_uring_cmd_done(struct io_uring_cmd *ioucmd, s32 ret, u64 res2,
 	if (req->flags & REQ_F_IOPOLL) {
 		/* order with io_do_iopoll() checking ->iopoll_completed */
 		smp_store_release(&req->iopoll_completed, 1);
-	} else if (issue_flags & IO_URING_F_COMPLETE_DEFER) {
+	} else if ((issue_flags & IO_URING_F_COMPLETE_DEFER) &&
+		   !io_issue_handed_off(issue_flags)) {
 		if (WARN_ON_ONCE(issue_flags & IO_URING_F_UNLOCKED))
 			return;
 		io_req_complete_defer(req);

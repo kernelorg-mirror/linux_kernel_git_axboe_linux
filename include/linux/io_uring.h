@@ -62,10 +62,14 @@ static inline int io_uring_fork(struct task_struct *tsk)
 
 /*
  * Called from sched_submit_work() when a task with PF_IO_HANDOFF set is
- * about to block. Placeholder for now.
+ * about to block, see io_uring/handoff.c
  */
+#if defined(CONFIG_IO_URING) && defined(CONFIG_THREAD_HANDOFF)
+void io_uring_task_sleeping(struct task_struct *tsk);
+#else
 static inline void io_uring_task_sleeping(struct task_struct *tsk)
 {
 }
+#endif
 
 #endif

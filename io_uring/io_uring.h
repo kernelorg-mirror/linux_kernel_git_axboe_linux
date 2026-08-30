@@ -211,6 +211,11 @@ void io_free_req(struct io_kiocb *req);
 void io_queue_next(struct io_kiocb *req);
 void io_task_refs_refill(struct io_uring_task *tctx);
 bool __io_alloc_req_refill(struct io_ring_ctx *ctx);
+int io_req_sqe_copy(struct io_kiocb *req, unsigned int issue_flags);
+int io_submit_sqes_end(struct io_ring_ctx *ctx, unsigned int entries,
+		       unsigned int left);
+int io_uring_enter_finish(struct io_ring_ctx *ctx, int ret, u32 min_complete,
+			  u32 flags, const void __user *argp, size_t argsz);
 
 void io_activate_pollwq(struct io_ring_ctx *ctx);
 void io_restriction_clone(struct io_restriction *dst, struct io_restriction *src);
@@ -389,13 +394,45 @@ static inline void io_put_file(struct io_kiocb *req)
 		fput(req->file);
 }
 
+/*
+ * A handed off issue continues with the issue_flags it started with but
+ * no longer holds the uring_lock: an io-wq worker that still has
+ * PF_IO_HANDOFF set, cleared once the issue returns.
+ */
+static inline bool io_issue_handed_off(unsigned int issue_flags)
+{
+	return !(issue_flags & IO_URING_F_UNLOCKED) &&
+		(current->flags & (PF_IO_HANDOFF | PF_IO_WORKER)) ==
+			(PF_IO_HANDOFF | PF_IO_WORKER);
+}
+
+/* which io-wq pool a request belongs in, bound unless a non-reg file op */
+static inline bool io_req_unbound(struct io_kiocb *req)
+{
+	if (!io_issue_defs[req->opcode].unbound_nonreg_file)
+		return false;
+	if (req->file) {
+		umode_t mode = file_inode(req->file)->i_mode;
+
+		if (S_ISREG(mode) || S_ISBLK(mode))
+			return false;
+	}
+	return true;
+}
+
+static inline bool io_issue_needs_lock(unsigned int issue_flags)
+{
+	return (issue_flags & IO_URING_F_UNLOCKED) ||
+		io_issue_handed_off(issue_flags);
+}
+
 static inline void io_ring_submit_unlock(struct io_ring_ctx *ctx,
 					 unsigned issue_flags)
 {
 	lockdep_assert_held(&ctx->uring_lock);
 	lockdep_assert(ctx->submit_lock_depth > 0);
 	ctx->submit_lock_depth--;
-	if (unlikely(issue_flags & IO_URING_F_UNLOCKED))
+	if (unlikely(io_issue_needs_lock(issue_flags)))
 		mutex_unlock(&ctx->uring_lock);
 }
 
@@ -412,7 +449,7 @@ static inline void io_ring_submit_lock(struct io_ring_ctx *ctx,
 	 * may touch ->uring_lock protected state; a non-zero depth count
 	 * means the lock holder is inside one and the lock must stay held.
 	 */
-	if (unlikely(issue_flags & IO_URING_F_UNLOCKED))
+	if (unlikely(io_issue_needs_lock(issue_flags)))
 		mutex_lock(&ctx->uring_lock);
 	lockdep_assert_held(&ctx->uring_lock);
 	ctx->submit_lock_depth++;
