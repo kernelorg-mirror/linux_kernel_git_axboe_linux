@@ -2010,12 +2010,31 @@ static bool io_get_sqe(struct io_ring_ctx *ctx, const struct io_uring_sqe **sqe)
 	return true;
 }
 
+static int io_submit_sqes_end(struct io_ring_ctx *ctx, unsigned int entries,
+			      unsigned int left)
+	__must_hold(&ctx->uring_lock)
+{
+	int ret = entries;
+
+	if (unlikely(left)) {
+		ret -= left;
+		/* try again if it submitted nothing and can't allocate a req */
+		if (!ret && io_req_cache_empty(ctx))
+			ret = -EAGAIN;
+		current->io_uring->cached_refs += left;
+	}
+
+	io_submit_state_end(ctx);
+	 /* Commit SQ ring head once we've consumed and submitted all SQEs */
+	io_commit_sqring(ctx);
+	return ret;
+}
+
 int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 	__must_hold(&ctx->uring_lock)
 {
 	unsigned int entries;
 	unsigned int left;
-	int ret;
 
 	if (ctx->flags & IORING_SETUP_SQ_REWIND)
 		entries = ctx->sq_entries;
@@ -2026,7 +2045,7 @@ int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 	if (unlikely(!entries))
 		return 0;
 
-	ret = left = entries;
+	left = entries;
 	io_get_task_refs(left);
 	io_submit_state_start(&ctx->submit_state, left);
 
@@ -2052,18 +2071,7 @@ int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 		}
 	} while (--left);
 
-	if (unlikely(left)) {
-		ret -= left;
-		/* try again if it submitted nothing and can't allocate a req */
-		if (!ret && io_req_cache_empty(ctx))
-			ret = -EAGAIN;
-		current->io_uring->cached_refs += left;
-	}
-
-	io_submit_state_end(ctx);
-	 /* Commit SQ ring head once we've consumed and submitted all SQEs */
-	io_commit_sqring(ctx);
-	return ret;
+	return io_submit_sqes_end(ctx, entries, left);
 }
 
 static void io_rings_free(struct io_ring_ctx *ctx)
@@ -2583,6 +2591,94 @@ struct file *io_uring_ctx_get_file(unsigned int fd, bool registered)
 }
 
 
+static int io_iopoll_getevents(struct io_ring_ctx *ctx, u32 min_complete,
+			       u32 flags, const void __user *argp, size_t argsz)
+	__must_hold(&ctx->uring_lock)
+{
+	int ret;
+
+	ret = io_validate_ext_arg(ctx, flags, argp, argsz);
+	if (likely(!ret))
+		return io_iopoll_check(ctx, min_complete);
+	return ret;
+}
+
+static int io_wait_getevents(struct io_ring_ctx *ctx, u32 min_complete,
+			     u32 flags, const void __user *argp, size_t argsz)
+{
+	struct ext_arg ext_arg = { .argsz = argsz };
+	int ret;
+
+	ret = io_get_ext_arg(ctx, flags, argp, &ext_arg);
+	if (likely(!ret))
+		return io_cqring_wait(ctx, min_complete, flags, &ext_arg);
+	return ret;
+}
+
+static int io_getevents_ret(struct io_ring_ctx *ctx, int ret, int ret2)
+{
+	if (ret)
+		return ret;
+	/*
+	 * EBADR indicates that one or more CQE were dropped. Once the user has
+	 * been informed we can clear the bit as they are obviously ok with
+	 * those drops.
+	 */
+	if (unlikely(ret2 == -EBADR))
+		clear_bit(IO_CHECK_CQ_DROPPED_BIT, &ctx->check_cq);
+	return ret2;
+}
+
+static int io_uring_getevents(struct io_ring_ctx *ctx, int ret,
+			      u32 min_complete, u32 flags,
+			      const void __user *argp, size_t argsz)
+{
+	int ret2;
+
+	if (ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL) {
+		/*
+		 * We disallow the app entering submit/complete with polling,
+		 * but we still need to lock the ring to prevent racing with
+		 * polled issue that got punted to a workqueue.
+		 */
+		mutex_lock(&ctx->uring_lock);
+		ret2 = io_iopoll_getevents(ctx, min_complete, flags, argp,
+					   argsz);
+		mutex_unlock(&ctx->uring_lock);
+	} else {
+		ret2 = io_wait_getevents(ctx, min_complete, flags, argp, argsz);
+	}
+	return io_getevents_ret(ctx, ret, ret2);
+}
+
+/* Finish an io_uring_enter() call that submitted and holds the uring_lock */
+static int io_uring_enter_finish(struct io_ring_ctx *ctx, int ret, u32 min_complete,
+			  u32 flags, const void __user *argp, size_t argsz)
+{
+	int ret2;
+
+	if (!(flags & IORING_ENTER_GETEVENTS)) {
+		mutex_unlock(&ctx->uring_lock);
+		return ret;
+	}
+
+	if (ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL) {
+		ret2 = io_iopoll_getevents(ctx, min_complete, flags, argp,
+					   argsz);
+		mutex_unlock(&ctx->uring_lock);
+	} else {
+		/*
+		 * Ignore errors, we'll soon call io_cqring_wait() and it
+		 * should handle ownership problems if any.
+		 */
+		if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
+			(void)io_run_local_work_locked(ctx, min_complete);
+		mutex_unlock(&ctx->uring_lock);
+		ret2 = io_wait_getevents(ctx, min_complete, flags, argp, argsz);
+	}
+	return io_getevents_ret(ctx, ret, ret2);
+}
+
 SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		u32, min_complete, u32, flags, const void __user *, argp,
 		size_t, argsz)
@@ -2639,57 +2735,14 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 			mutex_unlock(&ctx->uring_lock);
 			goto out;
 		}
-		if (flags & IORING_ENTER_GETEVENTS) {
-			if (ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL)
-				goto iopoll_locked;
-			/*
-			 * Ignore errors, we'll soon call io_cqring_wait() and
-			 * it should handle ownership problems if any.
-			 */
-			if (ctx->flags & IORING_SETUP_DEFER_TASKRUN)
-				(void)io_run_local_work_locked(ctx, min_complete);
-		}
-		mutex_unlock(&ctx->uring_lock);
+		ret = io_uring_enter_finish(ctx, ret, min_complete, flags,
+					    argp, argsz);
+		goto out;
 	}
 
-	if (flags & IORING_ENTER_GETEVENTS) {
-		int ret2;
-
-		if (ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL) {
-			/*
-			 * We disallow the app entering submit/complete with
-			 * polling, but we still need to lock the ring to
-			 * prevent racing with polled issue that got punted to
-			 * a workqueue.
-			 */
-			mutex_lock(&ctx->uring_lock);
-iopoll_locked:
-			ret2 = io_validate_ext_arg(ctx, flags, argp, argsz);
-			if (likely(!ret2))
-				ret2 = io_iopoll_check(ctx, min_complete);
-			mutex_unlock(&ctx->uring_lock);
-		} else {
-			struct ext_arg ext_arg = { .argsz = argsz };
-
-			ret2 = io_get_ext_arg(ctx, flags, argp, &ext_arg);
-			if (likely(!ret2))
-				ret2 = io_cqring_wait(ctx, min_complete, flags,
-						      &ext_arg);
-		}
-
-		if (!ret) {
-			ret = ret2;
-
-			/*
-			 * EBADR indicates that one or more CQE were dropped.
-			 * Once the user has been informed we can clear the bit
-			 * as they are obviously ok with those drops.
-			 */
-			if (unlikely(ret2 == -EBADR))
-				clear_bit(IO_CHECK_CQ_DROPPED_BIT,
-					  &ctx->check_cq);
-		}
-	}
+	if (flags & IORING_ENTER_GETEVENTS)
+		ret = io_uring_getevents(ctx, ret, min_complete, flags, argp,
+					 argsz);
 out:
 	if (!(flags & IORING_ENTER_REGISTERED_RING))
 		fput(file);
