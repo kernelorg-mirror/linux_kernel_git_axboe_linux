@@ -604,6 +604,13 @@ config ARCH_HAVE_EXTRA_ELF_NOTES
 config ARCH_HAS_NMI_SAFE_THIS_CPU_OPS
 	bool
 
+config ARCH_HAS_THREAD_HANDOFF
+	bool
+	help
+	  Architecture provides the arch_thread_handoff_*() hooks for moving
+	  the user visible register state of a thread that is blocked in the
+	  kernel to another thread of the same process.
+
 config HAVE_ALIGNED_STRUCT_PAGE
 	bool
 	help

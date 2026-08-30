@@ -96,6 +96,7 @@
 
 #include "../workqueue_internal.h"
 #include "../../io_uring/io-wq.h"
+#include <linux/thread_handoff.h>
 #include "../smpboot.h"
 #include "../locking/mutex.h"
 
@@ -5684,6 +5685,38 @@ static inline void prefetch_curr_exec_start(struct task_struct *p)
  * In case the task is currently running, return the runtime plus current's
  * pending runtime that have not been accounted yet.
  */
+#ifdef CONFIG_THREAD_HANDOFF
+/* keep the prev_sum_exec_runtime delta intact, slice accounting uses it */
+u64 sched_exec_runtime_take(struct task_struct *p)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+	u64 ns;
+
+	rq = task_rq_lock(p, &rf);
+	if (task_current_donor(rq, p) && task_on_rq_queued(p)) {
+		update_rq_clock(rq);
+		p->sched_class->update_curr(rq);
+	}
+	ns = p->se.sum_exec_runtime;
+	p->se.sum_exec_runtime = 0;
+	p->se.prev_sum_exec_runtime -= ns;
+	task_rq_unlock(rq, p, &rf);
+	return ns;
+}
+
+void sched_exec_runtime_add(struct task_struct *p, u64 ns)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	rq = task_rq_lock(p, &rf);
+	p->se.sum_exec_runtime += ns;
+	p->se.prev_sum_exec_runtime += ns;
+	task_rq_unlock(rq, p, &rf);
+}
+#endif
+
 unsigned long long task_sched_runtime(struct task_struct *p)
 {
 	struct rq_flags rf;
