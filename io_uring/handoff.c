@@ -31,12 +31,58 @@ int sysctl_io_uring_handoff __read_mostly = 1;
 
 static long io_handoff_resume(void);
 
+/*
+ * Can @req be issued inline in blocking mode with a handoff ready. Everything
+ * but the spare worker check is static, REQ_F_HANDOFF caches that part.
+ */
+bool io_handoff_possible(struct io_kiocb *req)
+{
+	const struct io_issue_def *def = &io_issue_defs[req->opcode];
+	struct io_ring_ctx *ctx = req->ctx;
+	struct io_uring_task *tctx = current->io_uring;
+
+	if (!sysctl_io_uring_handoff)
+		return false;
+	if (req->flags & REQ_F_HANDOFF)
+		goto check_spare;
+	if (!def->blockable)
+		return false;
+	/* nonblocking semantics were asked for, -EAGAIN is the answer */
+	if (req->flags & REQ_F_NOWAIT)
+		return false;
+	/* IOPOLL/SQPOLL issue differently, SQ_REWIND can't resume mid-batch */
+	if (ctx->flags & (IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL |
+			  IORING_SETUP_SQ_REWIND))
+		return false;
+	/* pollable files keep the nonblocking issue + poll retry path */
+	if (io_file_can_poll(req))
+		return false;
+	/* FMODE_NOWAIT files have a working nonblocking path, keep using it */
+	if ((def->pollin || def->pollout) && req->file &&
+	    (req->file->f_mode & FMODE_NOWAIT))
+		return false;
+	if (!tctx->io_wq)
+		return false;
+	/* an intermediate task's own user state doesn't matter, it stays */
+	if (!tctx->handoff.src && !thread_handoff_allowed(current))
+		return false;
+	/* the SQ head is published while we may still be running */
+	if (io_req_sqe_copy(req, IO_URING_F_INLINE))
+		return false;
+	req->flags |= REQ_F_HANDOFF;
+check_spare:
+	/* have a worker ready to take over */
+	if (!io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false))
+		return false;
+	return true;
+}
+
 /* fork a spare worker upfront, so the first blockable issue has a target */
 void io_handoff_prime(struct io_uring_task *tctx, struct io_ring_ctx *ctx)
 {
 	if (!sysctl_io_uring_handoff || !tctx->io_wq)
 		return;
-	/* handoffs are never done for these, see __io_handoff_begin() */
+	/* handoffs are never done for these, see io_handoff_possible() */
 	if (ctx->flags & (IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL |
 			  IORING_SETUP_SQ_REWIND))
 		return;
@@ -71,32 +117,9 @@ void __io_handoff_restore_signals(struct io_handoff *ho)
  */
 bool __io_handoff_begin(struct io_kiocb *req)
 {
-	struct io_ring_ctx *ctx = req->ctx;
-	struct io_uring_task *tctx = current->io_uring;
-	struct io_handoff *ho = &tctx->handoff;
+	struct io_handoff *ho = &current->io_uring->handoff;
 
-	if (!sysctl_io_uring_handoff)
-		return false;
-	/* nonblocking semantics were asked for, -EAGAIN is the answer */
-	if (req->flags & REQ_F_NOWAIT)
-		return false;
-	/* IOPOLL/SQPOLL issue differently, SQ_REWIND can't resume mid-batch */
-	if (ctx->flags & (IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL |
-			  IORING_SETUP_SQ_REWIND))
-		return false;
-	/* pollable files keep the nonblocking issue + poll retry path */
-	if (io_file_can_poll(req))
-		return false;
-	if (!tctx->io_wq)
-		return false;
-	/* an intermediate task's own user state doesn't matter, it stays */
-	if (!tctx->handoff.src && !thread_handoff_allowed(current))
-		return false;
-	/* the SQ head is published while we may still be running */
-	if (io_req_sqe_copy(req, IO_URING_F_INLINE))
-		return false;
-	/* have a worker ready to take over */
-	if (!io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false))
+	if (!io_handoff_possible(req))
 		return false;
 	/* would interrupt the issue right away, and can't be handled here */
 	if (task_sigpending(current))
