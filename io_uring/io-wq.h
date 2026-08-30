@@ -4,6 +4,7 @@
 
 #include <linux/refcount.h>
 #include <linux/io_uring_types.h>
+#include <linux/task_work.h>
 
 struct io_wq;
 
@@ -46,6 +47,19 @@ void io_wq_set_exit_on_idle(struct io_wq *wq, bool enable);
 
 void io_wq_enqueue(struct io_wq *wq, struct io_wq_work *work);
 void io_wq_hash_work(struct io_wq_work *work, void *val);
+
+typedef long (io_wq_handoff_fn)(void);
+
+/* claim an idle worker, it runs @fn instead of the worker loop when woken */
+struct task_struct *io_wq_handoff_claim(struct io_wq *wq, bool bound,
+					io_wq_handoff_fn *fn);
+
+void io_wq_handoff_commit(struct task_struct *dst);
+io_wq_handoff_fn *io_wq_handoff_worker(void);
+bool io_wq_handoff_spare(struct io_wq *wq, bool bound, bool topup);
+void io_wq_handoff_finished(struct task_struct *tsk);
+int io_wq_task_work_add(struct task_struct *task, struct callback_head *cb,
+			enum task_work_notify_mode notify);
 
 int io_wq_cpu_affinity(struct io_uring_task *tctx, cpumask_var_t mask);
 int io_wq_max_workers(struct io_wq *wq, int *new_count);
