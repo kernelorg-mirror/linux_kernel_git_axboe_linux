@@ -41,10 +41,12 @@
 #include <linux/ftrace.h>
 #include <linux/syscalls.h>
 #include <linux/iommu.h>
+#include <linux/thread_handoff.h>
 
 #include <asm/processor.h>
 #include <asm/pkru.h>
 #include <asm/fpu/sched.h>
+#include <asm/fpu/xstate.h>
 #include <asm/mmu_context.h>
 #include <asm/prctl.h>
 #include <asm/desc.h>
@@ -980,3 +982,137 @@ long do_arch_prctl_64(struct task_struct *task, int option, unsigned long arg2)
 
 	return ret;
 }
+
+#ifdef CONFIG_THREAD_HANDOFF
+/* Thread identity handoff, see include/linux/thread_handoff.h */
+
+/* prctl driven per-thread controls that __switch_to_xtra() applies */
+#define THREAD_HANDOFF_TIF_MATCH \
+	(_TIF_SSBD | _TIF_SPEC_IB | _TIF_NOCPUID | _TIF_NOTSC)
+
+/* state bound to the task that neither side may have */
+static bool thread_handoff_task_ok(struct task_struct *tsk)
+{
+	/* I/O permissions, the bitmap hangs off the task */
+	if (test_tsk_thread_flag(tsk, TIF_IO_BITMAP) || tsk->thread.iopl_emul)
+		return false;
+#ifdef CONFIG_X86_USER_SHADOW_STACK
+	/* the shadow stack is per-thread and would have to move along */
+	if (tsk->thread.features & ARCH_SHSTK_SHSTK)
+		return false;
+#endif
+	/* only the default sized FPU state gets copied over, no AMX */
+	if (x86_task_fpu(tsk)->fpstate->is_valloc)
+		return false;
+	return true;
+}
+
+bool arch_thread_handoff_allowed(struct task_struct *tsk)
+{
+	/* 64-bit tasks only */
+	if (test_tsk_thread_flag(tsk, TIF_ADDR32))
+		return false;
+	return thread_handoff_task_ok(tsk);
+}
+
+bool arch_thread_handoff_compatible(struct task_struct *src,
+				    struct task_struct *dst)
+{
+	/* these don't move, must match. They're usually applied process wide */
+	if ((read_task_thread_flags(src) ^ read_task_thread_flags(dst)) &
+	    THREAD_HANDOFF_TIF_MATCH)
+		return false;
+	return thread_handoff_task_ok(dst);
+}
+
+/*
+ * Sync the live user register state. TIF_NEED_FPU_LOAD makes the in-memory
+ * FPU image final, later context switches won't write it again.
+ */
+bool arch_thread_handoff_prepare(void)
+{
+	current_save_fsgs();
+	/* thread.pkru is only valid when scheduled out, make it so */
+	if (cpu_feature_enabled(X86_FEATURE_OSPKE))
+		current->thread.pkru = read_pkru();
+	fpregs_lock();
+	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+		save_fpregs_to_fpstate(x86_task_fpu(current));
+		set_thread_flag(TIF_NEED_FPU_LOAD);
+	}
+	fpregs_unlock();
+	return true;
+}
+
+/* copy the user register state over, load what __switch_to() would have */
+int arch_thread_handoff_finish(struct task_struct *src, bool leader)
+{
+	struct task_struct *dst = current;
+	struct thread_struct *t = &dst->thread, *s = &src->thread;
+	struct fpu *dst_fpu = x86_task_fpu(dst), *src_fpu = x86_task_fpu(src);
+	struct thread_struct prev;
+
+	/* the syscall frame, this is what the return to userspace restores */
+	*task_pt_regs(dst) = *task_pt_regs(src);
+
+	/* fault info, in case a signal for it is pending */
+	t->cr2 = s->cr2;
+	t->trap_nr = s->trap_nr;
+	t->error_code = s->error_code;
+
+	/*
+	 * Dynamic xstate permissions are a property of the process but live
+	 * in the group leader's struct fpu, see xstate_get_group_perm().
+	 */
+	if (leader && fpu_state_size_dynamic()) {
+		spin_lock_irq(&dst->sighand->siglock);
+		dst_fpu->perm = src_fpu->perm;
+		dst_fpu->guest_perm = src_fpu->guest_perm;
+		spin_unlock_irq(&dst->sighand->siglock);
+	}
+
+	/* both sides have the default sized fpstate, reload on the way out */
+	fpregs_lock();
+	memcpy(&dst_fpu->fpstate->regs, &src_fpu->fpstate->regs,
+	       src_fpu->fpstate->size);
+	dst_fpu->last_cpu = -1;
+	set_thread_flag(TIF_NEED_FPU_LOAD);
+	fpregs_unlock();
+
+	preempt_disable();
+
+	memcpy(t->tls_array, s->tls_array, sizeof(t->tls_array));
+	load_TLS(t, smp_processor_id());
+
+	savesegment(es, t->es);
+	if (unlikely(t->es | s->es))
+		loadsegment(es, s->es);
+	t->es = s->es;
+	savesegment(ds, t->ds);
+	if (unlikely(t->ds | s->ds))
+		loadsegment(ds, s->ds);
+	t->ds = s->ds;
+
+	/* FS/GS, the legacy load path needs to know what the CPU holds now */
+	local_irq_disable();
+	save_fsgs(dst);
+	prev.fsindex = t->fsindex;
+	prev.fsbase = t->fsbase;
+	prev.gsindex = t->gsindex;
+	prev.gsbase = t->gsbase;
+	t->fsindex = s->fsindex;
+	t->fsbase = s->fsbase;
+	t->gsindex = s->gsindex;
+	t->gsbase = s->gsbase;
+	x86_fsgsbase_load(&prev, t);
+	local_irq_enable();
+
+	if (cpu_feature_enabled(X86_FEATURE_OSPKE)) {
+		t->pkru = s->pkru;
+		write_pkru(t->pkru);
+	}
+
+	preempt_enable();
+	return 0;
+}
+#endif
