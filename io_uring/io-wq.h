@@ -47,6 +47,29 @@ void io_wq_set_exit_on_idle(struct io_wq *wq, bool enable);
 void io_wq_enqueue(struct io_wq *wq, struct io_wq_work *work);
 void io_wq_hash_work(struct io_wq_work *work, void *val);
 
+typedef long (io_wq_handoff_fn)(void);
+
+/*
+ * Handoff of a task's user identity to an idle worker. io_wq_handoff_claim()
+ * picks an idle worker and arranges for it to run @fn instead of its worker
+ * loop when it wakes up.
+ */
+struct task_struct *io_wq_handoff_claim(struct io_wq *wq, bool bound,
+					io_wq_handoff_fn *fn);
+
+/*
+ * io_wq_handoff_commit() turns the calling task into the worker whose identity
+ * was claimed. io_wq_handoff_worker() gets called by that worker to run the
+ * worker loop. The latter only returns if the task gets handed an identity
+ * again. A handoff function returns -EIOCBQUEUED if the task got demoted to a
+ * worker again while running it. When this happens, the worker is a regular
+ * io-wq worker again.
+ */
+void io_wq_handoff_commit(struct task_struct *dst);
+io_wq_handoff_fn *io_wq_handoff_worker(void);
+bool io_wq_handoff_spare(struct io_wq *wq, bool bound, bool topup);
+void io_wq_handoff_finished(struct task_struct *tsk);
+
 int io_wq_cpu_affinity(struct io_uring_task *tctx, cpumask_var_t mask);
 int io_wq_max_workers(struct io_wq *wq, int *new_count);
 bool io_wq_worker_stopped(void);

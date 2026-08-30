@@ -20,6 +20,7 @@
 #include <linux/sched/sysctl.h>
 #include <uapi/linux/io_uring.h>
 #include <linux/kcov.h>
+#include <linux/thread_handoff.h>
 
 #include "io-wq.h"
 #include "slist.h"
@@ -32,6 +33,21 @@ enum {
 	IO_WORKER_F_UP		= 0,	/* up and active */
 	IO_WORKER_F_RUNNING	= 1,	/* account as running */
 	IO_WORKER_F_FREE	= 2,	/* worker on free list */
+	IO_WORKER_F_IDLE_SLEEP	= 3,	/* in the idle sleep of the worker loop */
+};
+
+/*
+ * A claimer sets PROMOTE and wakes the worker, the worker acks with
+ * CLAIMED, the claimer sets DONE once it has taken the worker over, and
+ * FINISHED releases the demoted task once the identity migration is
+ * complete.
+ */
+enum {
+	IO_WORKER_HANDOFF_NONE		= 0,
+	IO_WORKER_HANDOFF_PROMOTE,
+	IO_WORKER_HANDOFF_CLAIMED,
+	IO_WORKER_HANDOFF_DONE,
+	IO_WORKER_HANDOFF_FINISHED,
 };
 
 enum {
@@ -64,6 +80,10 @@ struct io_worker {
 	struct callback_head create_work;
 	int init_retries;
 
+	atomic_t handoff;
+	io_wq_handoff_fn *handoff_fn;
+	struct task_struct *handoff_task;
+
 	union {
 		struct rcu_head rcu;
 		struct delayed_work work;
@@ -87,6 +107,12 @@ struct io_wq_acct {
 	unsigned nr_workers;
 	unsigned max_workers;
 	atomic_t nr_running;
+
+	/**
+	 * Workers currently in the idle sleep of the worker loop, claimable
+	 * for an identity handoff.
+	 */
+	atomic_t nr_iosleep;
 
 	/**
 	 * The list of free workers.  Protected by #workers_lock
@@ -233,7 +259,7 @@ static bool io_task_worker_match(struct callback_head *cb, void *data)
 	return worker == data;
 }
 
-static void io_worker_exit(struct io_worker *worker)
+static void __noreturn io_worker_exit(struct io_worker *worker)
 {
 	struct io_wq *wq = worker->wq;
 	struct io_wq_acct *acct = io_wq_get_acct(worker);
@@ -687,19 +713,64 @@ static void io_worker_handle_work(struct io_wq_acct *acct,
 	} while (1);
 }
 
-static int io_wq_worker(void *data)
+/*
+ * Check if we got claimed for a handoff while sleeping. If so, wait for
+ * the claimer to finish taking over. From that point the worker is theirs,
+ * we can only look at the handoff function.
+ */
+static io_wq_handoff_fn *io_wq_worker_promoted(struct io_worker *worker)
 {
-	struct io_worker *worker = data;
+	io_wq_handoff_fn *fn;
+	int state;
+
+	state = atomic_read_acquire(&worker->handoff);
+	if (state == IO_WORKER_HANDOFF_NONE)
+		return NULL;
+
+	/*
+	 * A promotion is only ever for the task the claimer picked. Don't
+	 * mistake a leftover DONE from a previous cycle for this one.
+	 */
+	if (worker->handoff_task != current)
+		return NULL;
+
+	/*
+	 * Ack the promotion so it can't be aborted anymore. If this fails,
+	 * the claimer either committed already (DONE), or aborted the claim
+	 * after failing to wake us (NONE). Bail for the latter, nobody
+	 * will set DONE.
+	 */
+	if (state == IO_WORKER_HANDOFF_PROMOTE) {
+		state = atomic_cmpxchg(&worker->handoff,
+				       IO_WORKER_HANDOFF_PROMOTE,
+				       IO_WORKER_HANDOFF_CLAIMED);
+		if (state == IO_WORKER_HANDOFF_NONE)
+			return NULL;
+	}
+
+	/*
+	 * The claimer may still be committing. Sleep rather than spin, we
+	 * may have preempted it on this CPU.
+	 */
+	fn = worker->handoff_fn;
+	wait_var_event(&worker->handoff,
+		atomic_read_acquire(&worker->handoff) == IO_WORKER_HANDOFF_DONE);
+	atomic_set(&worker->handoff, IO_WORKER_HANDOFF_NONE);
+	WARN_ON_ONCE(current->worker_private);
+	current->flags &= ~(PF_IO_WORKER | PF_USER_WORKER);
+	return fn;
+}
+
+/*
+ * The worker loop. Only returns if the worker gets claimed for a handoff,
+ * with the function to run for it. Otherwise the worker exits from here.
+ */
+static io_wq_handoff_fn *io_wq_worker_run(struct io_worker *worker)
+{
 	struct io_wq_acct *acct = io_wq_get_acct(worker);
-	struct io_wq *wq = worker->wq;
 	bool exit_mask = false, last_timeout = false;
-	char buf[TASK_COMM_LEN] = {};
-
-	set_mask_bits(&worker->flags, 0,
-		      BIT(IO_WORKER_F_UP) | BIT(IO_WORKER_F_RUNNING));
-
-	snprintf(buf, sizeof(buf), "iou-wrk-%d", wq->task->pid);
-	set_task_comm(current, buf);
+	struct io_wq *wq = worker->wq;
+	io_wq_handoff_fn *fn;
 
 	while (!test_bit(IO_WQ_BIT_EXIT, &wq->state)) {
 		long ret;
@@ -719,11 +790,18 @@ static int io_wq_worker(void *data)
 		 * or if someone modified our affinity. If wq is marked
 		 * idle-exit, drop the worker as well. This is used to avoid
 		 * keeping io-wq workers around for tasks that no longer have
-		 * any active io_uring instances.
+		 * any active io_uring instances. A demoted group leader stays,
+		 * exiting it would leave a zombie behind.
 		 */
-		if ((last_timeout && (exit_mask || acct->nr_workers > 1)) ||
-		    test_bit(IO_WQ_BIT_EXIT_ON_IDLE, &wq->state)) {
+		if (((last_timeout && (exit_mask || acct->nr_workers > 1)) ||
+		     test_bit(IO_WQ_BIT_EXIT_ON_IDLE, &wq->state)) &&
+		     !thread_group_leader(current)) {
 			acct->nr_workers--;
+			/* a handoff can't claim an exiting worker */
+			if (test_bit(IO_WORKER_F_FREE, &worker->flags)) {
+				clear_bit(IO_WORKER_F_FREE, &worker->flags);
+				hlist_nulls_del_rcu(&worker->nulls_node);
+			}
 			raw_spin_unlock(&acct->workers_lock);
 			__set_current_state(TASK_RUNNING);
 			break;
@@ -733,7 +811,18 @@ static int io_wq_worker(void *data)
 		raw_spin_unlock(&acct->workers_lock);
 		if (io_run_task_work())
 			continue;
+		/*
+		 * Claimable only while in this sleep - the free list alone
+		 * isn't enough, we may sleep elsewhere while on it.
+		 */
+		set_bit(IO_WORKER_F_IDLE_SLEEP, &worker->flags);
+		atomic_inc(&acct->nr_iosleep);
 		ret = schedule_timeout(WORKER_IDLE_TIMEOUT);
+		atomic_dec(&acct->nr_iosleep);
+		clear_bit(IO_WORKER_F_IDLE_SLEEP, &worker->flags);
+		fn = io_wq_worker_promoted(worker);
+		if (unlikely(fn))
+			return fn;
 		if (signal_pending(current)) {
 			struct ksignal ksig;
 
@@ -752,7 +841,185 @@ static int io_wq_worker(void *data)
 		io_worker_handle_work(acct, worker);
 
 	io_worker_exit(worker);
-	return 0;
+}
+
+static int io_wq_worker(void *data)
+{
+	struct io_worker *worker = data;
+	struct io_wq *wq = worker->wq;
+	io_wq_handoff_fn *fn;
+	char buf[TASK_COMM_LEN] = {};
+
+	set_mask_bits(&worker->flags, 0,
+		      BIT(IO_WORKER_F_UP) | BIT(IO_WORKER_F_RUNNING));
+
+	snprintf(buf, sizeof(buf), "iou-wrk-%d", wq->task->pid);
+	set_task_comm(current, buf);
+
+	/*
+	 * Only returns with a function to run if we got handed an identity.
+	 * -EIOCBQUEUED means we got demoted again while running it - back
+	 * to the worker loop without nesting stack frames.
+	 */
+	for (;;) {
+		long ret;
+
+		fn = io_wq_worker_run(worker);
+		ret = fn();
+		/* what we return is what userspace gets on some archs */
+		if (ret != -EIOCBQUEUED)
+			return ret;
+		worker = current->worker_private;
+	}
+}
+
+/* Find and claim an idle worker in the free list for handoff */
+static struct io_worker *io_wq_acct_handoff_claim(struct io_wq *wq,
+						  struct io_wq_acct *acct,
+						  io_wq_handoff_fn *fn)
+{
+	struct io_worker *worker, *found = NULL;
+	struct hlist_nulls_node *n;
+	struct task_struct *tsk;
+
+	raw_spin_lock(&acct->workers_lock);
+	if (test_bit(IO_WQ_BIT_EXIT, &wq->state))
+		goto out_unlock;
+	hlist_nulls_for_each_entry(worker, n, &acct->free_list, nulls_node) {
+		tsk = worker->task;
+		/* only claimable inside the idle sleep of the worker loop */
+		if (!test_bit(IO_WORKER_F_IDLE_SLEEP, &worker->flags))
+			continue;
+		if (!thread_handoff_compatible(current, tsk))
+			continue;
+		clear_bit(IO_WORKER_F_FREE, &worker->flags);
+		hlist_nulls_del_init_rcu(&worker->nulls_node);
+		found = worker;
+		break;
+	}
+out_unlock:
+	raw_spin_unlock(&acct->workers_lock);
+	if (!found)
+		return NULL;
+
+	found->handoff_fn = fn;
+	found->handoff_task = tsk;
+	atomic_set_release(&found->handoff, IO_WORKER_HANDOFF_PROMOTE);
+	if (wake_up_process(tsk))
+		return found;
+
+	/*
+	 * The worker was awake and may be past its promotion check. Undo
+	 * the claim unless it already picked it up.
+	 */
+	if (atomic_cmpxchg(&found->handoff, IO_WORKER_HANDOFF_PROMOTE,
+			   IO_WORKER_HANDOFF_NONE) != IO_WORKER_HANDOFF_PROMOTE)
+		return found;
+
+	raw_spin_lock(&acct->workers_lock);
+	__io_worker_idle(acct, found);
+	raw_spin_unlock(&acct->workers_lock);
+	return NULL;
+}
+
+/*
+ * Claim an idle worker to hand the current task's identity to, pairs with
+ * io_wq_handoff_commit().
+ */
+struct task_struct *io_wq_handoff_claim(struct io_wq *wq, bool bound,
+					io_wq_handoff_fn *fn)
+{
+	struct io_worker *worker;
+
+	worker = io_wq_acct_handoff_claim(wq, io_get_acct(wq, bound), fn);
+	if (!worker)
+		worker = io_wq_acct_handoff_claim(wq, io_get_acct(wq, !bound), fn);
+	if (worker)
+		return worker->task;
+	return NULL;
+}
+
+/*
+ * The claiming task takes over the worker @dst was; @dst goes on to run
+ * the handoff function as the user task.
+ */
+void io_wq_handoff_commit(struct task_struct *dst)
+{
+	struct io_worker *worker = dst->worker_private;
+	struct task_struct *src = current;
+	struct io_wq *wq = worker->wq;
+
+	WARN_ON_ONCE(src->worker_private);
+	WARN_ON_ONCE(worker->task != dst);
+
+	/* task flags are only ever modified by the task itself */
+	dst->worker_private = NULL;
+	src->worker_private = worker;
+	WRITE_ONCE(worker->task, src);
+	src->flags |= PF_IO_WORKER | PF_USER_WORKER;
+
+	/* the user task owns the wq */
+	get_task_struct(dst);
+	put_task_struct(wq->task);
+	WRITE_ONCE(wq->task, dst);
+
+	atomic_set_release(&worker->handoff, IO_WORKER_HANDOFF_DONE);
+	wake_up_var(&worker->handoff);
+}
+
+/*
+ * Worker loop entry for a demoted task. Only returns if it gets handed an
+ * identity again, with the function to run for it.
+ */
+io_wq_handoff_fn *io_wq_handoff_worker(void)
+{
+	struct io_worker *worker = current->worker_private;
+	char buf[TASK_COMM_LEN] = {};
+
+	WARN_ON_ONCE(!io_wq_current_is_worker());
+
+	/*
+	 * Wait for the promoted task to finish migrating our identity off
+	 * of us before acting as a worker - until then it reads our state,
+	 * including the comm we're about to rename.
+	 */
+	wait_var_event(&worker->handoff,
+		atomic_read_acquire(&worker->handoff) == IO_WORKER_HANDOFF_FINISHED);
+	atomic_set(&worker->handoff, IO_WORKER_HANDOFF_NONE);
+
+	snprintf(buf, sizeof(buf), "iou-wrk-%d", worker->wq->task->pid);
+	set_task_comm(current, buf);
+	set_cpus_allowed_ptr(current, worker->wq->cpu_mask);
+
+	return io_wq_worker_run(worker);
+}
+
+/* release the demoted task @tsk to run as the worker it now is */
+void io_wq_handoff_finished(struct task_struct *tsk)
+{
+	struct io_worker *worker = tsk->worker_private;
+
+	atomic_set_release(&worker->handoff, IO_WORKER_HANDOFF_FINISHED);
+	wake_up_var(&worker->handoff);
+}
+
+/* idle sleepers to keep around as handoff targets */
+#define IO_WQ_HANDOFF_SPARES	2
+
+/*
+ * Returns true if a worker is claimable, ie in the idle sleep. If @topup is
+ * true and the caller consumed a spare, fork a new worker if we're below the
+ * target.
+ */
+bool io_wq_handoff_spare(struct io_wq *wq, bool bound, bool topup)
+{
+	struct io_wq_acct *acct = io_get_acct(wq, bound);
+	unsigned int idle;
+
+	idle = atomic_read(&acct->nr_iosleep);
+	if (topup && idle < IO_WQ_HANDOFF_SPARES)
+		io_wq_create_worker(wq, acct);
+	return idle > 0;
 }
 
 /*
