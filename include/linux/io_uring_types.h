@@ -352,6 +352,12 @@ struct io_ring_ctx {
 	/* submission data */
 	struct {
 		struct mutex		uring_lock;
+		/*
+		 * Nesting depth of io_ring_submit_lock() sections entered by
+		 * the ->uring_lock holder. Non-zero means the issue path
+		 * relies on the lock being held.
+		 */
+		unsigned int		submit_lock_depth;
 
 		/*
 		 * Ring buffer of indices into array of io_uring_sqe, which is

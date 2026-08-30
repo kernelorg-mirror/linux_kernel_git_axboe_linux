@@ -29,6 +29,13 @@ struct io_issue_def {
 	unsigned		vectored : 1;
 	/* set to 1 if this opcode uses 128b sqes in a mixed sq */
 	unsigned		is_128 : 1;
+	/*
+	 * Issue path can run inline in blocking mode: past any potential
+	 * blocking point it touches ->uring_lock protected state only inside
+	 * io_ring_submit_lock() sections or via the core completion helpers.
+	 * uring_cmd can't, drivers may bind state to the submitting task.
+	 */
+	unsigned		blockable : 1;
 
 	/* size of async data needed, if any */
 	unsigned short		async_size;

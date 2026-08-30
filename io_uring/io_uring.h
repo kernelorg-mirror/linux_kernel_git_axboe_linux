@@ -393,6 +393,8 @@ static inline void io_ring_submit_unlock(struct io_ring_ctx *ctx,
 					 unsigned issue_flags)
 {
 	lockdep_assert_held(&ctx->uring_lock);
+	lockdep_assert(ctx->submit_lock_depth > 0);
+	ctx->submit_lock_depth--;
 	if (unlikely(issue_flags & IO_URING_F_UNLOCKED))
 		mutex_unlock(&ctx->uring_lock);
 }
@@ -405,10 +407,15 @@ static inline void io_ring_submit_lock(struct io_ring_ctx *ctx,
 	 * grab it from the system call. Same is true for the SQPOLL offload.
 	 * The only exception is when we've detached the request and issue it
 	 * from an async worker thread, grab the lock for that case.
+	 *
+	 * io_ring_submit_lock() sections are the only places an issue path
+	 * may touch ->uring_lock protected state; a non-zero depth count
+	 * means the lock holder is inside one and the lock must stay held.
 	 */
 	if (unlikely(issue_flags & IO_URING_F_UNLOCKED))
 		mutex_lock(&ctx->uring_lock);
 	lockdep_assert_held(&ctx->uring_lock);
+	ctx->submit_lock_depth++;
 }
 
 static inline void io_commit_cqring(struct io_ring_ctx *ctx)
