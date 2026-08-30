@@ -1810,7 +1810,7 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
 		if (state->need_plug && def->plug) {
 			state->plug_started = true;
 			state->need_plug = false;
-			blk_start_plug_nr_ios(&state->plug, state->submit_nr);
+			blk_start_plug_nr_ios(state->plug, state->submit_nr);
 		}
 	}
 
@@ -1938,13 +1938,14 @@ static void io_submit_state_end(struct io_ring_ctx *ctx)
 	/* flush only after queuing links as they can generate completions */
 	io_submit_flush_completions(ctx);
 	if (state->plug_started)
-		blk_finish_plug(&state->plug);
+		blk_finish_plug(state->plug);
 }
 
 /*
  * Start submission side cache.
  */
 static void io_submit_state_start(struct io_submit_state *state,
+				  struct blk_plug *plug,
 				  unsigned int max_ios)
 {
 	state->plug_started = false;
@@ -1952,6 +1953,12 @@ static void io_submit_state_start(struct io_submit_state *state,
 	state->submit_nr = max_ios;
 	/* set only head, no need to init link_last in advance */
 	state->link.head = NULL;
+	/*
+	 * The block layer caches current->plug across sleeps, so it must stay
+	 * with the task that started it even if the identity gets handed off
+	 * in the middle of a submission batch.
+	 */
+	state->plug = plug;
 }
 
 static void io_commit_sqring(struct io_ring_ctx *ctx)
@@ -2035,6 +2042,7 @@ int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 {
 	unsigned int entries;
 	unsigned int left;
+	struct blk_plug plug;
 
 	if (ctx->flags & IORING_SETUP_SQ_REWIND)
 		entries = ctx->sq_entries;
@@ -2047,7 +2055,7 @@ int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr)
 
 	left = entries;
 	io_get_task_refs(left);
-	io_submit_state_start(&ctx->submit_state, left);
+	io_submit_state_start(&ctx->submit_state, &plug, left);
 
 	do {
 		const struct io_uring_sqe *sqe;
