@@ -14,6 +14,7 @@ obj-y     = fork.o exec_domain.o exec_state.o panic.o \
 
 obj-$(CONFIG_MULTIUSER) += groups.o
 obj-$(CONFIG_VHOST_TASK) += vhost_task.o
+obj-$(CONFIG_THREAD_HANDOFF) += thread_handoff.o
 
 ifdef CONFIG_FUNCTION_TRACER
 # Do not trace internal ftrace files
