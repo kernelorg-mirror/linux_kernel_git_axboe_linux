@@ -60,4 +60,12 @@ static inline int io_uring_fork(struct task_struct *tsk)
 }
 #endif
 
+/*
+ * Called from sched_submit_work() when a task with PF_IO_HANDOFF set is
+ * about to block. Placeholder for now.
+ */
+static inline void io_uring_task_sleeping(struct task_struct *tsk)
+{
+}
+
 #endif

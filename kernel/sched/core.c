@@ -96,6 +96,7 @@
 
 #include "../workqueue_internal.h"
 #include "../../io_uring/io-wq.h"
+#include <linux/io_uring.h>
 #include <linux/thread_handoff.h>
 #include "../smpboot.h"
 #include "../locking/mutex.h"
@@ -7350,6 +7351,8 @@ static inline void sched_submit_work(struct task_struct *tsk)
 		wq_worker_sleeping(tsk);
 	else if (task_flags & PF_IO_WORKER)
 		io_wq_worker_sleeping(tsk);
+	else if (task_flags & PF_IO_HANDOFF)
+		io_uring_task_sleeping(tsk);
 
 	/*
 	 * spinlock and rwlock must not flush block requests.  This will
