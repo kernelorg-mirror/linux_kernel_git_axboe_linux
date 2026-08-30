@@ -11,6 +11,7 @@
 #include <linux/elf.h>
 #include <linux/export.h>
 #include <linux/sched.h>
+#include <linux/thread_handoff.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
@@ -1003,3 +1004,111 @@ int set_tsc_mode(unsigned int val)
 
 	return do_set_tsc_mode(val);
 }
+
+#ifdef CONFIG_THREAD_HANDOFF
+/*
+ * Thread identity handoff. The source is inside a syscall, so only the FPSIMD
+ * view of the vector registers needs to move. SME state is refused.
+ */
+static bool thread_handoff_task_ok(struct task_struct *tsk)
+{
+	if (is_compat_thread(task_thread_info(tsk)))
+		return false;
+	/* the GCS is per-thread and would have to move along */
+	if (task_gcs_el0_enabled(tsk))
+		return false;
+	/* counter-timer trapping doesn't move, see update_cntkctl_el1() */
+	if (test_tsk_thread_flag(tsk, TIF_TSC_SIGSEGV))
+		return false;
+	return true;
+}
+
+bool arch_thread_handoff_allowed(struct task_struct *tsk)
+{
+	return thread_handoff_task_ok(tsk);
+}
+
+bool arch_thread_handoff_compatible(struct task_struct *src,
+				    struct task_struct *dst)
+{
+	return thread_handoff_task_ok(dst);
+}
+
+/* sync the live user state, fpsimd_syscall_enter() guarantees FPSIMD format */
+bool arch_thread_handoff_prepare(void)
+{
+	struct thread_struct *thread = &current->thread;
+
+	fpsimd_preserve_current_state();
+	tls_preserve_current_state();
+	if (system_supports_poe())
+		thread->por_el0 = read_sysreg_s(SYS_POR_EL0);
+
+	if (WARN_ON_ONCE(thread->fp_type != FP_STATE_FPSIMD))
+		return false;
+	/* ZA and streaming mode state doesn't move, for now */
+	if (thread_sm_enabled(thread) || thread_za_enabled(thread))
+		return false;
+	return true;
+}
+
+/* copy the user register state over, load what the return to user won't */
+int arch_thread_handoff_finish(struct task_struct *src, bool leader)
+{
+	struct task_struct *dst = current;
+	struct pt_regs *regs = task_pt_regs(dst);
+	struct frame_record_meta stackframe = regs->stackframe;
+
+	/* the syscall frame, this is what the return to userspace restores */
+	*regs = *task_pt_regs(src);
+	regs->stackframe = stackframe;
+
+	/*
+	 * Marks our FP state foreign so nothing saves over what's copied in
+	 * below, and frees the SVE/SME buffers, the vector lengths may differ.
+	 */
+	fpsimd_flush_thread();
+
+	preempt_disable();
+
+	dst->thread.uw = src->thread.uw;
+	dst->thread.fp_type = FP_STATE_FPSIMD;
+	memcpy(dst->thread.vl, src->thread.vl, sizeof(dst->thread.vl));
+	memcpy(dst->thread.vl_onexec, src->thread.vl_onexec,
+	       sizeof(dst->thread.vl_onexec));
+	dst->thread.svcr = src->thread.svcr;
+	dst->thread.tpidr2_el0 = src->thread.tpidr2_el0;
+	dst->thread.por_el0 = src->thread.por_el0;
+	dst->thread.sctlr_user = src->thread.sctlr_user;
+#ifdef CONFIG_ARM64_MTE
+	dst->thread.mte_ctrl = src->thread.mte_ctrl;
+#endif
+#ifdef CONFIG_ARM64_PTR_AUTH
+	dst->thread.keys_user = src->thread.keys_user;
+#endif
+	update_tsk_thread_flag(dst, TIF_SVE_VL_INHERIT,
+			       test_tsk_thread_flag(src, TIF_SVE_VL_INHERIT));
+	update_tsk_thread_flag(dst, TIF_SME_VL_INHERIT,
+			       test_tsk_thread_flag(src, TIF_SME_VL_INHERIT));
+	update_tsk_thread_flag(dst, TIF_TAGGED_ADDR,
+			       test_tsk_thread_flag(src, TIF_TAGGED_ADDR));
+	update_tsk_thread_flag(dst, TIF_SSBD,
+			       test_tsk_thread_flag(src, TIF_SSBD));
+	if (test_and_clear_tsk_thread_flag(src, TIF_MTE_ASYNC_FAULT))
+		set_tsk_thread_flag(dst, TIF_MTE_ASYNC_FAULT);
+
+	/* load what __switch_to() would have, FPSIMD gets restored on exit */
+	write_sysreg(dst->thread.uw.tp_value, tpidr_el0);
+	if (system_supports_tpidr2())
+		write_sysreg_s(dst->thread.tpidr2_el0, SYS_TPIDR2_EL0);
+	if (system_supports_poe())
+		write_sysreg_s(dst->thread.por_el0, SYS_POR_EL0);
+	contextidr_thread_switch(dst);
+	ptrauth_thread_switch_user(dst);
+	mte_thread_switch(dst);
+	update_sctlr_el1(dst->thread.sctlr_user);
+
+	preempt_enable();
+	return 0;
+}
+#endif
