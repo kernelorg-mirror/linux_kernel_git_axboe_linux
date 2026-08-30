@@ -100,6 +100,9 @@ int io_tee(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (!(sp->flags & SPLICE_F_FD_IN_FIXED))
 		fput(in);
+	/* interrupted before making progress, have the core retry it */
+	if (io_issue_wants_restart(ret))
+		return -EAGAIN;
 done:
 	if (ret != sp->len)
 		req_set_fail(req);
@@ -141,6 +144,9 @@ int io_splice(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (!(sp->flags & SPLICE_F_FD_IN_FIXED))
 		fput(in);
+	/* interrupted before making progress, have the core retry it */
+	if (io_issue_wants_restart(ret))
+		return -EAGAIN;
 done:
 	if (ret != sp->len)
 		req_set_fail(req);

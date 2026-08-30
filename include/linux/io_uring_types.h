@@ -148,7 +148,6 @@ struct io_handoff {
 	struct io_kiocb			*req;
 	/* its ring and io-wq pool, @req is the demoted task's after that */
 	struct io_ring_ctx		*ctx;
-	bool				bound;
 	/* the submitter's signal mask while blocking issues run without */
 	sigset_t			sigmask;
 	bool				sigsaved;
@@ -565,6 +564,11 @@ struct io_ring_ctx {
 	/* io-wq management, e.g. thread count */
 	u32				iowq_limits[2];
 
+	/* opcodes that blocked in an inline issue, see io_handoff_possible() */
+	DECLARE_BITMAP(handoff_blocks, IORING_OP_LAST);
+	/* requests blocked inline or punted to io-wq, until they're freed */
+	atomic_t			blocking_inflight;
+
 	struct callback_head		poll_wq_task_work;
 	/* deferred ->poll_wq wake up for local task_work */
 	struct rcu_head			poll_wq_rcu;
@@ -665,6 +669,9 @@ enum {
 	REQ_F_SQE_COPIED_BIT,
 	REQ_F_IOPOLL_BIT,
 	REQ_F_DMABUF_BIT,
+	REQ_F_ASYNC_USER_BIT,
+	REQ_F_HANDOFF_BIT,
+	REQ_F_BLOCKING_BIT,
 
 	/* not a real bit, just to check we're not overflowing the space */
 	__REQ_F_LAST_BIT,
@@ -762,6 +769,12 @@ enum {
 	REQ_F_IOPOLL		= IO_REQ_FLAG(REQ_F_IOPOLL_BIT),
 	/* there is a dma map attached to request that needs to be dropped */
 	REQ_F_DMABUF		= IO_REQ_FLAG(REQ_F_DMABUF_BIT),
+	/* IOSQE_ASYNC was set on the SQE, not just by prep */
+	REQ_F_ASYNC_USER	= IO_REQ_FLAG(REQ_F_ASYNC_USER_BIT),
+	/* vetted at submit for an inline blocking issue with a handoff */
+	REQ_F_HANDOFF		= IO_REQ_FLAG(REQ_F_HANDOFF_BIT),
+	/* blocked inline or punted, counted in ctx->blocking_inflight */
+	REQ_F_BLOCKING		= IO_REQ_FLAG(REQ_F_BLOCKING_BIT),
 };
 
 struct io_tw_req {
