@@ -20,6 +20,7 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <asm/syscall.h>
+#include <trace/events/io_uring.h>
 
 #include "io_uring.h"
 #include "io-wq.h"
@@ -49,11 +50,15 @@ bool io_handoff_possible(struct io_kiocb *req)
 	/* nonblocking semantics were asked for, -EAGAIN is the answer */
 	if (req->flags & REQ_F_NOWAIT)
 		return false;
-	if (ctx->flags & (IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL))
+	if (ctx->flags & (IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL)) {
+		trace_io_uring_handoff_fail(req, "ring");
 		return false;
+	}
 	/* pollable files keep the nonblocking issue + poll retry path */
-	if (io_file_can_poll(req))
+	if (io_file_can_poll(req)) {
+		trace_io_uring_handoff_fail(req, "poll");
 		return false;
+	}
 	/*
 	 * Reads and writes on a file with FMODE_NOWAIT have a working
 	 * nonblocking path (inline completion, IOCB_WAITQ retry, or a
@@ -62,27 +67,26 @@ bool io_handoff_possible(struct io_kiocb *req)
 	 * up-front punt.
 	 */
 	if ((def->pollin || def->pollout) && req->file &&
-	    (req->file->f_mode & FMODE_NOWAIT))
+	    (req->file->f_mode & FMODE_NOWAIT)) {
+		trace_io_uring_handoff_fail(req, "nowait-file");
 		return false;
+	}
 	if (!tctx->io_wq)
 		return false;
-	if (!thread_handoff_allowed(current))
+	if (!thread_handoff_allowed(current)) {
+		trace_io_uring_handoff_fail(req, "task");
 		return false;
+	}
 	/* the SQ head is published while we may still be running */
-	if (io_req_sqe_copy(req, IO_URING_F_INLINE))
+	if (io_req_sqe_copy(req, IO_URING_F_INLINE)) {
+		trace_io_uring_handoff_fail(req, "sqe");
 		return false;
+	}
 	/* have a worker ready to take over */
-	return io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false);
-}
-
-/* Mark the task for a handoff if the inline issue of @req blocks */
-bool __io_handoff_begin(struct io_kiocb *req)
-{
-	if (!io_handoff_possible(req))
+	if (!io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false)) {
+		trace_io_uring_handoff_fail(req, "spare");
 		return false;
-
-	current->io_uring->handoff.req = req;
-	current->flags |= PF_IO_HANDOFF;
+	}
 	return true;
 }
 
@@ -99,6 +103,17 @@ void io_handoff_prime(struct io_uring_task *tctx, struct io_ring_ctx *ctx)
 	if (ctx->flags & (IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL))
 		return;
 	io_wq_handoff_spare(tctx->io_wq, true, true);
+}
+
+/* Mark the task for a handoff if the inline issue of @req blocks */
+bool __io_handoff_begin(struct io_kiocb *req)
+{
+	if (!io_handoff_possible(req))
+		return false;
+
+	current->io_uring->handoff.req = req;
+	current->flags |= PF_IO_HANDOFF;
+	return true;
 }
 
 /* Returns true if the identity got handed off during the issue */
@@ -210,10 +225,14 @@ void io_uring_task_sleeping(struct task_struct *tsk)
 	WARN_ON_ONCE(tsk != current);
 
 	/* the issue path is touching state that needs the ring lock held */
-	if (ctx->submit_lock_depth)
+	if (ctx->submit_lock_depth) {
+		trace_io_uring_handoff_fail(req, "lock");
 		return;
-	if (!thread_handoff_prepare(tsk))
+	}
+	if (!thread_handoff_prepare(tsk)) {
+		trace_io_uring_handoff_fail(req, "prepare");
 		return;
+	}
 
 	/*
 	 * Should the woken worker land on this CPU, keep it from running
@@ -224,12 +243,14 @@ void io_uring_task_sleeping(struct task_struct *tsk)
 				  io_handoff_resume);
 	if (!dst) {
 		preempt_enable();
+		trace_io_uring_handoff_fail(req, "worker");
 		return;
 	}
 
 	/* committed - PF_IO_HANDOFF stays set until the issue returns */
 	ho->src = tsk;
 	thread_handoff_stats_take(&ho->stats);
+	trace_io_uring_handoff(req, dst);
 
 	io_handoff_release_ring(ctx);
 	io_handoff_move_tctx(tctx, tsk, dst);
@@ -284,6 +305,8 @@ static long io_handoff_resume(void)
 
 	if (WARN_ON_ONCE(thread_handoff_finish(src, &ho->stats)))
 		force_sig(SIGKILL);
+	trace_io_uring_handoff_resume(ctx, req, task_pid_nr(src), ho->consumed,
+				      ho->to_submit);
 	io_wq_handoff_finished(src);
 	put_task_struct_many(src, ho->src_refs);
 	ho->src_refs = 0;
