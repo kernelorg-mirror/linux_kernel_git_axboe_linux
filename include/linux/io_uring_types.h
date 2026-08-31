@@ -669,7 +669,6 @@ enum {
 	REQ_F_SQE_COPIED_BIT,
 	REQ_F_IOPOLL_BIT,
 	REQ_F_DMABUF_BIT,
-	REQ_F_ASYNC_USER_BIT,
 	REQ_F_HANDOFF_BIT,
 	REQ_F_BLOCKING_BIT,
 
@@ -769,8 +768,6 @@ enum {
 	REQ_F_IOPOLL		= IO_REQ_FLAG(REQ_F_IOPOLL_BIT),
 	/* there is a dma map attached to request that needs to be dropped */
 	REQ_F_DMABUF		= IO_REQ_FLAG(REQ_F_DMABUF_BIT),
-	/* IOSQE_ASYNC was set on the SQE, not just by prep */
-	REQ_F_ASYNC_USER	= IO_REQ_FLAG(REQ_F_ASYNC_USER_BIT),
 	/* vetted at submit for an inline blocking issue with a handoff */
 	REQ_F_HANDOFF		= IO_REQ_FLAG(REQ_F_HANDOFF_BIT),
 	/* blocked inline or punted, counted in ctx->blocking_inflight */
