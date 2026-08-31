@@ -371,10 +371,9 @@ int io_buffers_select(struct io_kiocb *req, struct buf_sel_arg *arg,
 		ret = io_provided_buffers_select(req, &arg->out_len, sel->buf_list, arg->iovs);
 	}
 out_unlock:
-	if (issue_flags & IO_URING_F_UNLOCKED) {
+	if (issue_flags & IO_URING_F_UNLOCKED)
 		sel->buf_list = NULL;
-		mutex_unlock(&ctx->uring_lock);
-	}
+	io_ring_submit_unlock(ctx, issue_flags);
 	return ret;
 }
 
