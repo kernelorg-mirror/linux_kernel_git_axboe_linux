@@ -20,6 +20,7 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <asm/syscall.h>
+#include <trace/events/io_uring.h>
 
 #include "io_uring.h"
 #include "io-wq.h"
@@ -47,16 +48,20 @@ bool io_handoff_possible(struct io_kiocb *req)
 	 * This batch handed off once already, the rest of it goes to io-wq:
 	 * at depth, parallel workers beat a hop per blocking request.
 	 */
-	if (tctx->handoff.src)
+	if (tctx->handoff.src) {
+		trace_io_uring_handoff_fail(req, "chain");
 		return false;
+	}
 	/*
 	 * An opcode that blocked here before, with blocking work of this ring
 	 * still in flight: the inline issue would only add a hop, punt it.
 	 * Nothing in flight is the latency bound case, that one hands off.
 	 */
 	if (test_bit(req->opcode, ctx->handoff_blocks) &&
-	    atomic_read(&ctx->blocking_inflight))
+	    atomic_read(&ctx->blocking_inflight)) {
+		trace_io_uring_handoff_fail(req, "depth");
 		return false;
+	}
 	if (req->flags & REQ_F_HANDOFF)
 		goto check_spare;
 	if (!def->blockable)
@@ -66,15 +71,21 @@ bool io_handoff_possible(struct io_kiocb *req)
 		return false;
 	/* IOPOLL/SQPOLL issue differently, SQ_REWIND can't resume mid-batch */
 	if (ctx->flags & (IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL |
-			  IORING_SETUP_SQ_REWIND | IORING_SETUP_NO_HANDOFF))
+			  IORING_SETUP_SQ_REWIND | IORING_SETUP_NO_HANDOFF)) {
+		trace_io_uring_handoff_fail(req, "ring");
 		return false;
+	}
 	/* pollable files keep the nonblocking issue + poll retry path */
-	if (io_file_can_poll(req))
+	if (io_file_can_poll(req)) {
+		trace_io_uring_handoff_fail(req, "poll");
 		return false;
+	}
 	/* FMODE_NOWAIT files have a working nonblocking path, keep using it */
 	if ((def->pollin || def->pollout) && req->file &&
-	    (req->file->f_mode & FMODE_NOWAIT))
+	    (req->file->f_mode & FMODE_NOWAIT)) {
+		trace_io_uring_handoff_fail(req, "nowait-file");
 		return false;
+	}
 	if (!tctx->io_wq)
 		return false;
 check_spare:
@@ -83,16 +94,22 @@ check_spare:
 	 * with no idle sleeper the request falls back to the io-wq punt
 	 * anyway, and the claim at block time stays authoritative.
 	 */
-	if (!io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false))
+	if (!io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false)) {
+		trace_io_uring_handoff_fail(req, "spare");
 		return false;
+	}
 	if (req->flags & REQ_F_HANDOFF)
 		return true;
 	/* an intermediate task's own user state doesn't matter, it stays */
-	if (!tctx->handoff.src && !thread_handoff_allowed(current))
+	if (!tctx->handoff.src && !thread_handoff_allowed(current)) {
+		trace_io_uring_handoff_fail(req, "task");
 		return false;
+	}
 	/* the SQ head is published while we may still be running */
-	if (io_req_sqe_copy(req, IO_URING_F_INLINE))
+	if (io_req_sqe_copy(req, IO_URING_F_INLINE)) {
+		trace_io_uring_handoff_fail(req, "sqe");
 		return false;
+	}
 	req->flags |= REQ_F_HANDOFF;
 	return true;
 }
@@ -142,8 +159,10 @@ bool __io_handoff_begin(struct io_kiocb *req)
 	if (!io_handoff_possible(req))
 		return false;
 	/* would interrupt the issue right away, and can't be handled here */
-	if (task_sigpending(current))
+	if (task_sigpending(current)) {
+		trace_io_uring_handoff_fail(req, "signal");
 		return false;
+	}
 
 	ho->req = req;
 	io_handoff_block_signals(ho);
@@ -271,10 +290,14 @@ void io_uring_task_sleeping(struct task_struct *tsk)
 	WARN_ON_ONCE(tsk != current);
 
 	/* the issue path is touching state that needs the ring lock held */
-	if (ctx->submit_lock_depth)
+	if (ctx->submit_lock_depth) {
+		trace_io_uring_handoff_fail(req, "lock");
 		return;
-	if (src == tsk && !thread_handoff_prepare(tsk))
+	}
+	if (src == tsk && !thread_handoff_prepare(tsk)) {
+		trace_io_uring_handoff_fail(req, "prepare");
 		return;
+	}
 
 	/* don't let the woken worker preempt us before we've committed */
 	preempt_disable();
@@ -284,6 +307,7 @@ void io_uring_task_sleeping(struct task_struct *tsk)
 		preempt_enable();
 		if (src == tsk)
 			thread_handoff_unmark(tsk);
+		trace_io_uring_handoff_fail(req, "worker");
 		return;
 	}
 
@@ -294,6 +318,7 @@ void io_uring_task_sleeping(struct task_struct *tsk)
 	/* our accounting follows the identity, an intermediate's doesn't */
 	if (src == tsk)
 		thread_handoff_stats_take(&ho->stats);
+	trace_io_uring_handoff(req, dst);
 
 	/* this opcode blocks on this ring, and it's in flight from here on */
 	__set_bit(req->opcode, ctx->handoff_blocks);
@@ -347,6 +372,9 @@ static long io_handoff_resume(void)
 	struct io_ring_ctx *ctx = ho->ctx;
 	long ret;
 	long submit_err = 0;
+
+	trace_io_uring_handoff_resume(ctx, ho->req, task_pid_nr(prev),
+				      ho->consumed, ho->to_submit);
 
 	/* enough of the identity to issue requests on its behalf */
 	thread_handoff_adopt_creds(src);
