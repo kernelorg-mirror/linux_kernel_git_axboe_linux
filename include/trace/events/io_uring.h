@@ -671,6 +671,120 @@ TRACE_EVENT(io_uring_local_work_run,
 	TP_printk("ring %p, count %d, loops %u", __entry->ctx, __entry->count, __entry->loops)
 );
 
+/**
+ * io_uring_handoff - a blocked submitter hands its identity to a worker
+ *
+ * @req:	pointer to a submitted request
+ * @dst:	the idle io-wq worker task taking over
+ */
+TRACE_EVENT(io_uring_handoff,
+
+	TP_PROTO(struct io_kiocb *req, struct task_struct *dst),
+
+	TP_ARGS(req, dst),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  void *,	req		)
+		__field(  u64,		user_data	)
+		__field(  u8,		opcode		)
+		__field(  pid_t,	src_pid		)
+		__field(  pid_t,	dst_pid		)
+
+		__string( op_str, io_uring_get_opcode(req->opcode)	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= req->ctx;
+		__entry->req		= req;
+		__entry->user_data	= req->cqe.user_data;
+		__entry->opcode		= req->opcode;
+		__entry->src_pid	= task_pid_nr(current);
+		__entry->dst_pid	= task_pid_nr(dst);
+
+		__assign_str(op_str);
+	),
+
+	TP_printk("ring %p, request %p, user_data 0x%llx, opcode %s, identity %d handed to worker %d",
+		__entry->ctx, __entry->req, __entry->user_data,
+		__get_str(op_str), __entry->src_pid, __entry->dst_pid)
+);
+
+/**
+ * io_uring_handoff_fail - a handoff didn't happen for a request
+ *
+ * @req:	pointer to the request being issued
+ * @reason:	why. "lock", "prepare" and "worker" mean the task blocked in
+ *		place, anything else that it took the io-wq punt path instead.
+ */
+TRACE_EVENT(io_uring_handoff_fail,
+
+	TP_PROTO(struct io_kiocb *req, const char *reason),
+
+	TP_ARGS(req, reason),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  void *,	req		)
+		__field(  u64,		user_data	)
+		__field(  u8,		opcode		)
+
+		__string( op_str, io_uring_get_opcode(req->opcode)	)
+		__string( reason, reason			)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= req->ctx;
+		__entry->req		= req;
+		__entry->user_data	= req->cqe.user_data;
+		__entry->opcode		= req->opcode;
+
+		__assign_str(op_str);
+		__assign_str(reason);
+	),
+
+	TP_printk("ring %p, request %p, user_data 0x%llx, opcode %s, %s",
+		__entry->ctx, __entry->req, __entry->user_data,
+		__get_str(op_str), __get_str(reason))
+);
+
+/**
+ * io_uring_handoff_resume - a promoted worker continues the submission
+ *
+ * @ctx:	pointer to a ring context structure
+ * @req:	the request that blocked, owned by the demoted task by now
+ * @worker:	pid the demoted task now runs under
+ * @consumed:	SQEs consumed by earlier handoffs of this syscall
+ * @to_submit:	SQE count the syscall asked for
+ */
+TRACE_EVENT(io_uring_handoff_resume,
+
+	TP_PROTO(void *ctx, void *req, pid_t worker, unsigned int consumed,
+		 unsigned int to_submit),
+
+	TP_ARGS(ctx, req, worker, consumed, to_submit),
+
+	TP_STRUCT__entry (
+		__field(  void *,	ctx		)
+		__field(  void *,	req		)
+		__field(  pid_t,	worker		)
+		__field(  unsigned int,	consumed	)
+		__field(  unsigned int,	to_submit	)
+	),
+
+	TP_fast_assign(
+		__entry->ctx		= ctx;
+		__entry->req		= req;
+		__entry->worker		= worker;
+		__entry->consumed	= consumed;
+		__entry->to_submit	= to_submit;
+	),
+
+	TP_printk("ring %p, request %p now on worker %d, consumed %u, to_submit %u",
+		__entry->ctx, __entry->req, __entry->worker,
+		__entry->consumed, __entry->to_submit)
+);
+
 #endif /* _TRACE_IO_URING_H */
 
 /* This part must be outside protection */
