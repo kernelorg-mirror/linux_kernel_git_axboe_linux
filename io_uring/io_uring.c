@@ -1770,8 +1770,6 @@ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	/* same numerical values with corresponding REQ_F_*, safe to copy */
 	sqe_flags = READ_ONCE(sqe->flags);
 	req->flags = (__force io_req_flags_t) sqe_flags;
-	if (sqe_flags & IOSQE_ASYNC)
-		req->flags |= REQ_F_ASYNC_USER;
 	req->cqe.user_data = READ_ONCE(sqe->user_data);
 	req->file = NULL;
 	req->tctx = current->io_uring;
@@ -1921,9 +1919,6 @@ static bool io_req_force_async(struct io_kiocb *req)
 		return true;
 	if (!(req->flags & REQ_F_FORCE_ASYNC))
 		return false;
-	/* userspace asked for it, keep the explicit offload */
-	if (req->flags & REQ_F_ASYNC_USER)
-		return true;
 	if (req->ctx->int_flags & IO_RING_F_DRAIN_ACTIVE)
 		return true;
 	/* the file decides on pollability, resolve it now if fixed */
