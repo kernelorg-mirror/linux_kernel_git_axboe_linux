@@ -153,6 +153,8 @@ struct io_uring_task {
 	struct file			*registered_rings[IO_RINGFD_REG_MAX];
 
 	struct xarray			xa;
+	/* the nodes in ->xa, for walking without the xarray lookup cost */
+	struct list_head		node_list;
 	struct wait_queue_head		wait;
 	atomic_t			in_cancel;
 	atomic_t			inflight_tracked;
