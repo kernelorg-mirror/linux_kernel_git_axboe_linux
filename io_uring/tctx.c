@@ -105,6 +105,7 @@ __cold struct io_uring_task *io_uring_alloc_task_context(struct task_struct *tas
 
 	tctx->task = task;
 	xa_init(&tctx->xa);
+	INIT_LIST_HEAD(&tctx->node_list);
 	init_waitqueue_head(&tctx->wait);
 	atomic_set(&tctx->in_cancel, 0);
 	atomic_set(&tctx->inflight_tracked, 0);
@@ -135,6 +136,7 @@ static int io_tctx_install_node(struct io_ring_ctx *ctx,
 		kfree(node);
 		return ret;
 	}
+	list_add(&node->tctx_link, &tctx->node_list);
 
 	mutex_lock(&ctx->tctx_lock);
 	list_add(&node->ctx_node, &ctx->tctx_list);
@@ -227,6 +229,7 @@ __cold void io_uring_del_tctx_node(unsigned long index)
 
 	WARN_ON_ONCE(current != node->task);
 	WARN_ON_ONCE(list_empty(&node->ctx_node));
+	list_del(&node->tctx_link);
 
 	mutex_lock(&node->ctx->tctx_lock);
 	list_del(&node->ctx_node);
@@ -243,11 +246,10 @@ __cold void io_uring_del_tctx_node(unsigned long index)
 __cold void io_uring_clean_tctx(struct io_uring_task *tctx)
 {
 	struct io_wq *wq = tctx->io_wq;
-	struct io_tctx_node *node;
-	unsigned long index;
+	struct io_tctx_node *node, *tmp;
 
-	xa_for_each(&tctx->xa, index, node) {
-		io_uring_del_tctx_node(index);
+	list_for_each_entry_safe(node, tmp, &tctx->node_list, tctx_link) {
+		io_uring_del_tctx_node((unsigned long)node->ctx);
 		cond_resched();
 	}
 	if (wq) {
