@@ -2,6 +2,8 @@
 
 struct io_tctx_node {
 	struct list_head	ctx_node;
+	/* on tctx->node_list, only ever touched by the owning task */
+	struct list_head	tctx_link;
 	struct task_struct	*task;
 	struct io_ring_ctx	*ctx;
 };
