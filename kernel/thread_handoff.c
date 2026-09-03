@@ -216,7 +216,19 @@ static void thread_handoff_leader(struct task_struct *dst,
 				  struct task_struct *src)
 	__must_hold(&tasklist_lock)
 {
+	struct list_head *prev = dst->thread_node.prev;
 	struct task_struct *t;
+
+	/*
+	 * The leader must be first on ->thread_head, thread_group_empty()
+	 * and the next_thread() wraparound rely on it. Swap the two list
+	 * positions. RCU readers may see a thread twice, never miss one.
+	 */
+	if (prev == &src->thread_node)
+		prev = &dst->thread_node;
+	list_del_rcu(&dst->thread_node);
+	list_replace_rcu(&src->thread_node, &dst->thread_node);
+	list_add_rcu(&src->thread_node, prev);
 
 	transfer_pid(src, dst, PIDTYPE_TGID);
 	transfer_pid(src, dst, PIDTYPE_PGID);
