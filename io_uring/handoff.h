@@ -44,12 +44,15 @@ static inline void io_handoff_enter(struct file *file, u32 to_submit,
 	ho->argsz = argsz;
 }
 
-/* a submit call is done issuing, restore the signal mask if we changed it */
+/*
+ * Done issuing, restore the signal mask if we changed it. Not with a handoff
+ * in flight, io_handoff_resume() does that once it has the identity.
+ */
 static inline void io_handoff_submit_end(void)
 {
 	struct io_handoff *ho = &current->io_uring->handoff;
 
-	if (unlikely(ho->sigsaved))
+	if (unlikely(ho->sigsaved) && !ho->src)
 		__io_handoff_restore_signals(ho);
 }
 

@@ -151,9 +151,10 @@ struct io_handoff {
 	/* the submitter's signal mask while blocking issues run without */
 	sigset_t			sigmask;
 	bool				sigsaved;
-	/* the task the identity came from, and the task refs it held */
+	/* identity source, and the task this hop took the worker from */
 	struct task_struct		*src;
-	unsigned int			src_refs;
+	struct task_struct		*prev;
+	unsigned int			prev_refs;
 	struct thread_handoff_stats	stats;
 	/* io_uring_enter() arguments, to resume the syscall */
 	struct file			*file;

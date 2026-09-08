@@ -393,6 +393,12 @@ static void thread_handoff_creds(struct task_struct *dst,
 	put_cred_many(old, 2);
 }
 
+/* the part of thread_handoff_finish() needed to run kernel code for @src */
+void thread_handoff_adopt_creds(struct task_struct *src)
+{
+	thread_handoff_creds(current, src);
+}
+
 /* the user requested affinity follows, the effective mask derives from it */
 static void thread_handoff_affinity(struct task_struct *dst,
 				    struct task_struct *src)
