@@ -89,7 +89,8 @@ bool __io_handoff_begin(struct io_kiocb *req)
 		return false;
 	if (!tctx->io_wq)
 		return false;
-	if (!thread_handoff_allowed(current))
+	/* an intermediate task's own user state doesn't matter, it stays */
+	if (!tctx->handoff.src && !thread_handoff_allowed(current))
 		return false;
 	/* the SQ head is published while we may still be running */
 	if (io_req_sqe_copy(req, IO_URING_F_INLINE))
@@ -98,12 +99,15 @@ bool __io_handoff_begin(struct io_kiocb *req)
 	if (!io_wq_handoff_spare(tctx->io_wq, !io_req_unbound(req), false))
 		return false;
 	/* would interrupt the issue right away, and can't be handled here */
-	if (signal_pending(current))
+	if (task_sigpending(current))
 		return false;
 
 	ho->req = req;
 	io_handoff_block_signals(ho);
 	current->flags |= PF_IO_HANDOFF;
+	/* already queued task_work gets picked up by io_handoff_end() too */
+	if (test_thread_flag(TIF_NOTIFY_SIGNAL))
+		clear_notify_signal();
 	return true;
 }
 
@@ -148,8 +152,8 @@ static void io_handoff_task_refs(struct io_uring_task *tctx,
 	WRITE_ONCE(tctx->task, dst);
 	raw_spin_unlock(&tctx->task_ref_lock);
 
-	/* dropped by the promoted task once it's done taking over */
-	tctx->handoff.src_refs = nr;
+	/* dropped by the promoted task */
+	tctx->handoff.prev_refs = nr;
 }
 
 /* move tctx task_work queued on @task along to the tctx's new task */
@@ -205,6 +209,8 @@ void io_uring_task_sleeping(struct task_struct *tsk)
 	struct io_handoff *ho = &tctx->handoff;
 	struct io_kiocb *req = ho->req;
 	struct io_ring_ctx *ctx = req->ctx;
+	/* the identity being handed around, ours unless we're intermediate */
+	struct task_struct *src = ho->src ?: tsk;
 	struct task_struct *dst;
 	bool bound;
 
@@ -213,23 +219,26 @@ void io_uring_task_sleeping(struct task_struct *tsk)
 	/* the issue path is touching state that needs the ring lock held */
 	if (ctx->submit_lock_depth)
 		return;
-	if (!thread_handoff_prepare(tsk))
+	if (src == tsk && !thread_handoff_prepare(tsk))
 		return;
 
 	/* don't let the woken worker preempt us before we've committed */
 	preempt_disable();
 	bound = !io_req_unbound(req);
-	dst = io_wq_handoff_claim(tctx->io_wq, bound, io_handoff_resume);
+	dst = io_wq_handoff_claim(tctx->io_wq, bound, io_handoff_resume, src);
 	if (!dst) {
 		preempt_enable();
 		return;
 	}
 
 	/* committed, @req is ours as the worker from here on */
-	ho->src = tsk;
+	ho->src = src;
+	ho->prev = tsk;
 	ho->ctx = ctx;
 	ho->bound = bound;
-	thread_handoff_stats_take(&ho->stats);
+	/* our accounting follows the identity, an intermediate's doesn't */
+	if (src == tsk)
+		thread_handoff_stats_take(&ho->stats);
 
 	io_handoff_release_ring(ctx, ho);
 	io_handoff_move_tctx(tctx, tsk, dst);
@@ -261,24 +270,29 @@ int io_handoff_complete(struct io_kiocb *req, int ret)
 	return -EIOCBQUEUED;
 }
 
-/* runs on the promoted task, finishes io_uring_enter() for the submitter */
+/*
+ * Runs on the promoted task, finishes io_uring_enter() for the submitter. Only
+ * takes its identity if it gets through the submission without handing off.
+ */
 static long io_handoff_resume(void)
 {
 	struct io_uring_task *tctx = current->io_uring;
 	struct io_handoff *ho = &tctx->handoff;
-	struct task_struct *src = ho->src;
+	struct task_struct *src = ho->src, *prev = ho->prev;
 	struct io_ring_ctx *ctx = ho->ctx;
 	bool bound = ho->bound;
 	long ret;
 
-	if (WARN_ON_ONCE(thread_handoff_finish(src, &ho->stats)))
-		force_sig(SIGKILL);
-	io_wq_handoff_finished(src);
-	put_task_struct_many(src, ho->src_refs);
-	ho->src_refs = 0;
-	ho->src = NULL;
+	/* enough of the identity to issue requests on its behalf */
+	thread_handoff_adopt_creds(src);
+	put_task_struct_many(prev, ho->prev_refs);
+	ho->prev_refs = 0;
+	ho->prev = NULL;
 	ho->req = NULL;
 	ho->ctx = NULL;
+	/* an intermediate task has nothing we still need, let it work */
+	if (prev != src)
+		io_wq_handoff_finished(prev);
 
 	/* flush what the blocked batch left behind, then submit the rest */
 	io_run_task_work();
@@ -291,12 +305,20 @@ static long io_handoff_resume(void)
 		if (ret > 0)
 			ho->consumed += ret;
 	}
-	/* the identity came with the mask the blocking issue ran under */
-	io_handoff_submit_end();
+
+	mutex_unlock(&ctx->uring_lock);
+
+	/* submission done, become the submitter and return to userspace */
+	if (WARN_ON_ONCE(thread_handoff_finish(src, &ho->stats)))
+		force_sig(SIGKILL);
+	if (ho->sigsaved)
+		__io_handoff_restore_signals(ho);
+	io_wq_handoff_finished(src);
+	ho->src = NULL;
+
 	ret = ho->consumed;
-	if (ret != ho->to_submit) {
-		mutex_unlock(&ctx->uring_lock);
-	} else {
+	if (ret == ho->to_submit && (ho->flags & IORING_ENTER_GETEVENTS)) {
+		mutex_lock(&ctx->uring_lock);
 		ret = io_uring_enter_finish(ctx, ret, ho->min_complete,
 					    ho->flags, ho->argp, ho->argsz);
 	}

@@ -52,7 +52,8 @@ typedef long (io_wq_handoff_fn)(void);
 
 /* claim an idle worker, it runs @fn instead of the worker loop when woken */
 struct task_struct *io_wq_handoff_claim(struct io_wq *wq, bool bound,
-					io_wq_handoff_fn *fn);
+					io_wq_handoff_fn *fn,
+					struct task_struct *src);
 
 void io_wq_handoff_commit(struct task_struct *dst);
 io_wq_handoff_fn *io_wq_handoff_worker(void);
