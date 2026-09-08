@@ -829,22 +829,22 @@ static int io_wq_worker(void *data)
 	 * Only returns if we got handed an identity. -EIOCBQUEUED means we got
 	 * demoted again while running it, back to the worker loop.
 	 */
+	fn = io_wq_worker_run(worker);
 	for (;;) {
-		long ret;
+		long ret = fn();
 
-		fn = io_wq_worker_run(worker);
-		ret = fn();
 		/* what we return is what userspace gets on some archs */
 		if (ret != -EIOCBQUEUED)
 			return ret;
-		worker = current->worker_private;
+		fn = io_wq_handoff_worker();
 	}
 }
 
 /* find and claim an idle sleeping worker, see io_wq_worker_idle_done() */
 static struct io_worker *io_wq_acct_handoff_claim(struct io_wq *wq,
 						  struct io_wq_acct *acct,
-						  io_wq_handoff_fn *fn)
+						  io_wq_handoff_fn *fn,
+						  struct task_struct *src)
 {
 	struct io_worker *worker, *found = NULL;
 	struct hlist_nulls_node *n;
@@ -856,7 +856,7 @@ static struct io_worker *io_wq_acct_handoff_claim(struct io_wq *wq,
 		/* only claimable inside the idle sleep of the worker loop */
 		if (!test_bit(IO_WORKER_F_IDLE_SLEEP, &worker->flags))
 			continue;
-		if (!thread_handoff_compatible(current, worker->task))
+		if (!thread_handoff_compatible(src, worker->task))
 			continue;
 		clear_bit(IO_WORKER_F_FREE, &worker->flags);
 		hlist_nulls_del_init_rcu(&worker->nulls_node);
@@ -897,15 +897,17 @@ int io_wq_task_work_add(struct task_struct *task, struct callback_head *cb,
 	return 0;
 }
 
-/* claim an idle worker to hand our identity to, pairs with _commit() */
+/* claim an idle worker to hand @src's identity to, pairs with _commit() */
 struct task_struct *io_wq_handoff_claim(struct io_wq *wq, bool bound,
-					io_wq_handoff_fn *fn)
+					io_wq_handoff_fn *fn,
+					struct task_struct *src)
 {
 	struct io_worker *worker;
 
-	worker = io_wq_acct_handoff_claim(wq, io_get_acct(wq, bound), fn);
+	worker = io_wq_acct_handoff_claim(wq, io_get_acct(wq, bound), fn, src);
 	if (!worker)
-		worker = io_wq_acct_handoff_claim(wq, io_get_acct(wq, !bound), fn);
+		worker = io_wq_acct_handoff_claim(wq, io_get_acct(wq, !bound),
+						  fn, src);
 	if (worker)
 		return worker->task;
 	return NULL;
@@ -958,9 +960,14 @@ io_wq_handoff_fn *io_wq_handoff_worker(void)
 
 	WARN_ON_ONCE(!io_wq_current_is_worker());
 
-	/* the promoted task reads our state until it's done migrating it */
-	wait_var_event(&worker->handoff,
-		atomic_read_acquire(&worker->handoff) == IO_WORKER_HANDOFF_FINISHED);
+	/*
+	 * Wait until nobody needs our state anymore, which may be a while if
+	 * an identity is still parked on us. Hence TASK_IDLE.
+	 */
+	___wait_var_event(&worker->handoff,
+			  atomic_read_acquire(&worker->handoff) ==
+						IO_WORKER_HANDOFF_FINISHED,
+			  TASK_IDLE, 0, 0, schedule());
 	atomic_set(&worker->handoff, IO_WORKER_HANDOFF_NONE);
 
 	snprintf(buf, sizeof(buf), "iou-wrk-%d", worker->wq->task->pid);

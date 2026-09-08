@@ -29,6 +29,7 @@ bool thread_handoff_compatible(struct task_struct *src,
 			       struct task_struct *dst);
 bool thread_handoff_prepare(struct task_struct *tsk);
 void thread_handoff_stats_take(struct thread_handoff_stats *st);
+void thread_handoff_adopt_creds(struct task_struct *src);
 int thread_handoff_finish(struct task_struct *src,
 			  struct thread_handoff_stats *st);
 
@@ -60,6 +61,9 @@ static inline bool thread_handoff_prepare(struct task_struct *tsk)
 	return false;
 }
 static inline void thread_handoff_stats_take(struct thread_handoff_stats *st)
+{
+}
+static inline void thread_handoff_adopt_creds(struct task_struct *src)
 {
 }
 static inline int thread_handoff_finish(struct task_struct *src,
