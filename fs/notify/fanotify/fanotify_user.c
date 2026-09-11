@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <linux/uio.h>
 #include <linux/compat.h>
 #include <linux/sched/signal.h>
 #include <linux/memcontrol.h>
@@ -379,14 +380,14 @@ static int create_fd(struct fsnotify_group *group, const struct path *path,
 	return client_fd;
 }
 
-static int process_access_response_info(const char __user *info,
+static int process_access_response_info(struct iov_iter *from,
 					size_t info_len,
 				struct fanotify_response_info_audit_rule *friar)
 {
 	if (info_len != sizeof(*friar))
 		return -EINVAL;
 
-	if (copy_from_user(friar, info, sizeof(*friar)))
+	if (!copy_from_iter_full(friar, sizeof(*friar), from))
 		return -EFAULT;
 
 	if (friar->hdr.type != FAN_RESPONSE_INFO_AUDIT_RULE)
@@ -426,7 +427,7 @@ static void finish_permission_event(struct fsnotify_group *group,
 
 static int process_access_response(struct fsnotify_group *group,
 				   struct fanotify_response *response_struct,
-				   const char __user *info,
+				   struct iov_iter *info,
 				   size_t info_len)
 {
 	struct fanotify_perm_event *event;
@@ -436,8 +437,8 @@ static int process_access_response(struct fsnotify_group *group,
 	int ret = info_len;
 	struct fanotify_response_info_audit_rule friar;
 
-	pr_debug("%s: group=%p fd=%d response=%x errno=%d buf=%p size=%zu\n",
-		 __func__, group, fd, response, errno, info, info_len);
+	pr_debug("%s: group=%p fd=%d response=%x errno=%d size=%zu\n",
+		 __func__, group, fd, response, errno, info_len);
 	/*
 	 * make sure the response is valid, if invalid we do nothing and either
 	 * userspace can send a valid response or we will clean it up after the
@@ -511,26 +512,26 @@ static int process_access_response(struct fsnotify_group *group,
 }
 
 static size_t copy_mnt_info_to_user(struct fanotify_event *event,
-				    char __user *buf, int count)
+				    struct iov_iter *to)
 {
 	struct fanotify_event_info_mnt info = { };
 
 	info.hdr.info_type = FAN_EVENT_INFO_TYPE_MNT;
 	info.hdr.len = FANOTIFY_MNT_INFO_LEN;
 
-	if (WARN_ON(count < info.hdr.len))
+	if (WARN_ON(iov_iter_count(to) < info.hdr.len))
 		return -EFAULT;
 
 	info.mnt_id = FANOTIFY_ME(event)->mnt_id;
 
-	if (copy_to_user(buf, &info, sizeof(info)))
+	if (copy_to_iter(&info, sizeof(info), to) != sizeof(info))
 		return -EFAULT;
 
 	return info.hdr.len;
 }
 
 static size_t copy_error_info_to_user(struct fanotify_event *event,
-				      char __user *buf, int count)
+				      struct iov_iter *to)
 {
 	struct fanotify_event_info_error info = { };
 	struct fanotify_error_event *fee = FANOTIFY_EE(event);
@@ -538,13 +539,13 @@ static size_t copy_error_info_to_user(struct fanotify_event *event,
 	info.hdr.info_type = FAN_EVENT_INFO_TYPE_ERROR;
 	info.hdr.len = FANOTIFY_ERROR_INFO_LEN;
 
-	if (WARN_ON(count < info.hdr.len))
+	if (WARN_ON(iov_iter_count(to) < info.hdr.len))
 		return -EFAULT;
 
 	info.error = fee->error;
 	info.error_count = fee->err_count;
 
-	if (copy_to_user(buf, &info, sizeof(info)))
+	if (copy_to_iter(&info, sizeof(info), to) != sizeof(info))
 		return -EFAULT;
 
 	return info.hdr.len;
@@ -553,7 +554,7 @@ static size_t copy_error_info_to_user(struct fanotify_event *event,
 static int copy_fid_info_to_user(__kernel_fsid_t *fsid, struct fanotify_fh *fh,
 				 int info_type, const char *name,
 				 size_t name_len,
-				 char __user *buf, size_t count)
+				 struct iov_iter *to)
 {
 	struct fanotify_event_info_fid info = { };
 	struct file_handle handle = { };
@@ -563,9 +564,9 @@ static int copy_fid_info_to_user(__kernel_fsid_t *fsid, struct fanotify_fh *fh,
 	size_t len = info_len;
 
 	pr_debug("%s: fh_len=%zu name_len=%zu, info_len=%zu, count=%zu\n",
-		 __func__, fh_len, name_len, info_len, count);
+		 __func__, fh_len, name_len, info_len, iov_iter_count(to));
 
-	if (WARN_ON_ONCE(len < sizeof(info) || len > count))
+	if (WARN_ON_ONCE(len < sizeof(info) || len > iov_iter_count(to)))
 		return -EFAULT;
 
 	/*
@@ -591,10 +592,9 @@ static int copy_fid_info_to_user(__kernel_fsid_t *fsid, struct fanotify_fh *fh,
 	info.hdr.info_type = info_type;
 	info.hdr.len = len;
 	info.fsid = *fsid;
-	if (copy_to_user(buf, &info, sizeof(info)))
+	if (copy_to_iter(&info, sizeof(info), to) != sizeof(info))
 		return -EFAULT;
 
-	buf += sizeof(info);
 	len -= sizeof(info);
 	if (WARN_ON_ONCE(len < sizeof(handle)))
 		return -EFAULT;
@@ -606,10 +606,9 @@ static int copy_fid_info_to_user(__kernel_fsid_t *fsid, struct fanotify_fh *fh,
 	if (!fh_len)
 		handle.handle_type = FILEID_INVALID;
 
-	if (copy_to_user(buf, &handle, sizeof(handle)))
+	if (copy_to_iter(&handle, sizeof(handle), to) != sizeof(handle))
 		return -EFAULT;
 
-	buf += sizeof(handle);
 	len -= sizeof(handle);
 	if (WARN_ON_ONCE(len < fh_len))
 		return -EFAULT;
@@ -623,10 +622,9 @@ static int copy_fid_info_to_user(__kernel_fsid_t *fsid, struct fanotify_fh *fh,
 		memcpy(bounce, fh_buf, fh_len);
 		fh_buf = bounce;
 	}
-	if (copy_to_user(buf, fh_buf, fh_len))
+	if (copy_to_iter(fh_buf, fh_len, to) != fh_len)
 		return -EFAULT;
 
-	buf += fh_len;
 	len -= fh_len;
 
 	if (name_len) {
@@ -635,49 +633,46 @@ static int copy_fid_info_to_user(__kernel_fsid_t *fsid, struct fanotify_fh *fh,
 		if (WARN_ON_ONCE(len < name_len))
 			return -EFAULT;
 
-		if (copy_to_user(buf, name, name_len))
+		if (copy_to_iter(name, name_len, to) != name_len)
 			return -EFAULT;
 
-		buf += name_len;
 		len -= name_len;
 	}
 
 	/* Pad with 0's */
 	WARN_ON_ONCE(len < 0 || len >= FANOTIFY_EVENT_ALIGN);
-	if (len > 0 && clear_user(buf, len))
+	if (len > 0 && iov_iter_zero(len, to) != len)
 		return -EFAULT;
 
 	return info_len;
 }
 
-static int copy_pidfd_info_to_user(int pidfd,
-				   char __user *buf,
-				   size_t count)
+static int copy_pidfd_info_to_user(int pidfd, struct iov_iter *to)
 {
 	struct fanotify_event_info_pidfd info = { };
 	size_t info_len = FANOTIFY_PIDFD_INFO_LEN;
 
-	if (WARN_ON_ONCE(info_len > count))
+	if (WARN_ON_ONCE(info_len > iov_iter_count(to)))
 		return -EFAULT;
 
 	info.hdr.info_type = FAN_EVENT_INFO_TYPE_PIDFD;
 	info.hdr.len = info_len;
 	info.pidfd = pidfd;
 
-	if (copy_to_user(buf, &info, info_len))
+	if (copy_to_iter(&info, info_len, to) != info_len)
 		return -EFAULT;
 
 	return info_len;
 }
 
 static size_t copy_range_info_to_user(struct fanotify_event *event,
-				      char __user *buf, int count)
+				      struct iov_iter *to)
 {
 	struct fanotify_perm_event *pevent = FANOTIFY_PERM(event);
 	struct fanotify_event_info_range info = { };
 	size_t info_len = FANOTIFY_RANGE_INFO_LEN;
 
-	if (WARN_ON_ONCE(info_len > count))
+	if (WARN_ON_ONCE(info_len > iov_iter_count(to)))
 		return -EFAULT;
 
 	info.hdr.info_type = FAN_EVENT_INFO_TYPE_RANGE;
@@ -685,7 +680,7 @@ static size_t copy_range_info_to_user(struct fanotify_event *event,
 	info.offset = pevent->pos;
 	info.count = pevent->count;
 
-	if (copy_to_user(buf, &info, info_len))
+	if (copy_to_iter(&info, info_len, to) != info_len)
 		return -EFAULT;
 
 	return info_len;
@@ -694,7 +689,7 @@ static size_t copy_range_info_to_user(struct fanotify_event *event,
 static int copy_info_records_to_user(struct fanotify_event *event,
 				     struct fanotify_info *info,
 				     unsigned int info_mode, int pidfd,
-				     char __user *buf, size_t count)
+				     struct iov_iter *to)
 {
 	int ret, total_bytes = 0, info_type = 0;
 	unsigned int fid_mode = info_mode & FANOTIFY_FID_BITS;
@@ -718,12 +713,10 @@ static int copy_info_records_to_user(struct fanotify_event *event,
 					    fanotify_info_dir_fh(info),
 					    info_type,
 					    fanotify_info_name(info),
-					    info->name_len, buf, count);
+					    info->name_len, to);
 		if (ret < 0)
 			return ret;
 
-		buf += ret;
-		count -= ret;
 		total_bytes += ret;
 	}
 
@@ -734,12 +727,10 @@ static int copy_info_records_to_user(struct fanotify_event *event,
 					    fanotify_info_dir2_fh(info),
 					    info_type,
 					    fanotify_info_name2(info),
-					    info->name2_len, buf, count);
+					    info->name2_len, to);
 		if (ret < 0)
 			return ret;
 
-		buf += ret;
-		count -= ret;
 		total_bytes += ret;
 	}
 
@@ -783,50 +774,39 @@ static int copy_info_records_to_user(struct fanotify_event *event,
 
 		ret = copy_fid_info_to_user(fanotify_event_fsid(event),
 					    fanotify_event_object_fh(event),
-					    info_type, dot, dot_len,
-					    buf, count);
+					    info_type, dot, dot_len, to);
 		if (ret < 0)
 			return ret;
 
-		buf += ret;
-		count -= ret;
 		total_bytes += ret;
 	}
 
 	if (pidfd_mode) {
-		ret = copy_pidfd_info_to_user(pidfd, buf, count);
+		ret = copy_pidfd_info_to_user(pidfd, to);
 		if (ret < 0)
 			return ret;
 
-		buf += ret;
-		count -= ret;
 		total_bytes += ret;
 	}
 
 	if (fanotify_is_error_event(event->mask)) {
-		ret = copy_error_info_to_user(event, buf, count);
+		ret = copy_error_info_to_user(event, to);
 		if (ret < 0)
 			return ret;
-		buf += ret;
-		count -= ret;
 		total_bytes += ret;
 	}
 
 	if (fanotify_event_has_access_range(event)) {
-		ret = copy_range_info_to_user(event, buf, count);
+		ret = copy_range_info_to_user(event, to);
 		if (ret < 0)
 			return ret;
-		buf += ret;
-		count -= ret;
 		total_bytes += ret;
 	}
 
 	if (fanotify_is_mnt_event(event->mask)) {
-		ret = copy_mnt_info_to_user(event, buf, count);
+		ret = copy_mnt_info_to_user(event, to);
 		if (ret < 0)
 			return ret;
-		buf += ret;
-		count -= ret;
 		total_bytes += ret;
 	}
 
@@ -835,7 +815,7 @@ static int copy_info_records_to_user(struct fanotify_event *event,
 
 static ssize_t copy_event_to_user(struct fsnotify_group *group,
 				  struct fanotify_event *event,
-				  char __user *buf, size_t count)
+				  struct iov_iter *to)
 {
 	struct fanotify_event_metadata metadata;
 	const struct path *path = fanotify_event_path(event);
@@ -923,17 +903,14 @@ static ssize_t copy_event_to_user(struct fsnotify_group *group,
 	 * Sanity check copy size in case get_one_event() and
 	 * event_len sizes ever get out of sync.
 	 */
-	if (WARN_ON_ONCE(metadata.event_len > count))
+	if (WARN_ON_ONCE(metadata.event_len > iov_iter_count(to)))
 		goto out_close_fd;
 
-	if (copy_to_user(buf, &metadata, FAN_EVENT_METADATA_LEN))
+	if (copy_to_iter(&metadata, FAN_EVENT_METADATA_LEN, to) !=
+	    FAN_EVENT_METADATA_LEN)
 		goto out_close_fd;
 
-	buf += FAN_EVENT_METADATA_LEN;
-	count -= FAN_EVENT_METADATA_LEN;
-
-	ret = copy_info_records_to_user(event, info, info_mode, pidfd,
-					buf, count);
+	ret = copy_info_records_to_user(event, info, info_mode, pidfd, to);
 	if (ret < 0)
 		goto out_close_fd;
 
@@ -977,16 +954,15 @@ static __poll_t fanotify_poll(struct file *file, poll_table *wait)
 	return ret;
 }
 
-static ssize_t fanotify_read(struct file *file, char __user *buf,
-			     size_t count, loff_t *pos)
+static ssize_t fanotify_read(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct file *file = iocb->ki_filp;
 	struct fsnotify_group *group;
 	struct fanotify_event *event;
-	char __user *start;
+	size_t done = 0;
 	int ret;
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 
-	start = buf;
 	group = file->private_data;
 
 	pr_debug("%s: group=%p\n", __func__, group);
@@ -998,7 +974,7 @@ static ssize_t fanotify_read(struct file *file, char __user *buf,
 		 * in case there are lots of available events.
 		 */
 		cond_resched();
-		event = get_one_event(group, count);
+		event = get_one_event(group, iov_iter_count(to));
 		if (IS_ERR(event)) {
 			ret = PTR_ERR(event);
 			break;
@@ -1006,21 +982,22 @@ static ssize_t fanotify_read(struct file *file, char __user *buf,
 
 		if (!event) {
 			ret = -EAGAIN;
-			if (file->f_flags & O_NONBLOCK)
+			if (file->f_flags & O_NONBLOCK ||
+			    iocb->ki_flags & IOCB_NOWAIT)
 				break;
 
 			ret = -ERESTARTSYS;
 			if (signal_pending(current))
 				break;
 
-			if (start != buf)
+			if (done)
 				break;
 
 			wait_woken(&wait, TASK_INTERRUPTIBLE, MAX_SCHEDULE_TIMEOUT);
 			continue;
 		}
 
-		ret = copy_event_to_user(group, event, buf, count);
+		ret = copy_event_to_user(group, event, to);
 
 		/*
 		 * Permission events get queued to wait for response.  Other
@@ -1044,40 +1021,39 @@ static ssize_t fanotify_read(struct file *file, char __user *buf,
 		}
 		if (ret < 0)
 			break;
-		buf += ret;
-		count -= ret;
+		done += ret;
 	}
 	remove_wait_queue(&group->notification_waitq, &wait);
 
-	if (start != buf && ret != -EFAULT)
-		ret = buf - start;
+	if (done && ret != -EFAULT)
+		ret = done;
 	return ret;
 }
 
-static ssize_t fanotify_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+static ssize_t fanotify_write(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct fanotify_response response;
 	struct fsnotify_group *group;
+	size_t count = iov_iter_count(from);
 	int ret;
-	const char __user *info_buf = buf + sizeof(struct fanotify_response);
 	size_t info_len;
 
 	if (!IS_ENABLED(CONFIG_FANOTIFY_ACCESS_PERMISSIONS))
 		return -EINVAL;
 
-	group = file->private_data;
+	group = iocb->ki_filp->private_data;
 
 	pr_debug("%s: group=%p count=%zu\n", __func__, group, count);
 
 	if (count < sizeof(response))
 		return -EINVAL;
 
-	if (copy_from_user(&response, buf, sizeof(response)))
+	if (!copy_from_iter_full(&response, sizeof(response), from))
 		return -EFAULT;
 
 	info_len = count - sizeof(response);
 
-	ret = process_access_response(group, &response, info_buf, info_len);
+	ret = process_access_response(group, &response, from, info_len);
 	if (ret < 0)
 		count = ret;
 	else
@@ -1174,8 +1150,8 @@ static long fanotify_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 static const struct file_operations fanotify_fops = {
 	.show_fdinfo	= fanotify_show_fdinfo,
 	.poll		= fanotify_poll,
-	.read		= fanotify_read,
-	.write		= fanotify_write,
+	.read_iter	= fanotify_read,
+	.write_iter	= fanotify_write,
 	.fasync		= NULL,
 	.release	= fanotify_release,
 	.unlocked_ioctl	= fanotify_ioctl,
@@ -1727,7 +1703,8 @@ SYSCALL_DEFINE2(fanotify_init, unsigned int, flags, unsigned int, event_f_flags)
 
 	fd = FD_ADD(f_flags,
 		    anon_inode_getfile_fmode("[fanotify]", &fanotify_fops,
-					     group, f_flags, FMODE_NONOTIFY));
+					     group, f_flags,
+					     FMODE_NONOTIFY | FMODE_NOWAIT));
 	if (fd >= 0)
 		retain_and_null_ptr(group);
 	return fd;
