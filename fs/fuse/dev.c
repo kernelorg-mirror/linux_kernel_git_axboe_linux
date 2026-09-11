@@ -1542,7 +1542,7 @@ __releases(fiq->lock)
  * fuse_request_end().  Otherwise add it to the processing list, and set
  * the 'sent' flag.
  */
-static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
+static ssize_t fuse_dev_do_read(struct fuse_dev *fud, bool nonblock,
 				struct fuse_copy_state *cs, size_t nbytes)
 {
 	ssize_t err;
@@ -1579,7 +1579,7 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 			break;
 		spin_unlock(&fiq->lock);
 
-		if (file->f_flags & O_NONBLOCK)
+		if (nonblock)
 			return -EAGAIN;
 		err = wait_event_interruptible_exclusive(fiq->waitq,
 				!fiq->connected || request_pending(fiq));
@@ -1685,6 +1685,7 @@ static int fuse_dev_open(struct inode *inode, struct file *file)
 		return -ENOMEM;
 
 	file->private_data = fud;
+	file->f_mode |= FMODE_NOWAIT;
 	return 0;
 }
 
@@ -1710,8 +1711,15 @@ static ssize_t fuse_dev_read(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct fuse_copy_state cs;
 	struct file *file = iocb->ki_filp;
-	struct fuse_dev *fud = fuse_get_dev(file);
+	bool nonblock = file->f_flags & O_NONBLOCK ||
+			iocb->ki_flags & IOCB_NOWAIT;
+	struct fuse_dev *fud;
 
+	/* don't wait for a sync init mount to attach the device either */
+	if (nonblock && !__fuse_get_dev(file))
+		return fuse_file_to_fud(file)->sync_init ? -EAGAIN : -EPERM;
+
+	fud = fuse_get_dev(file);
 	if (IS_ERR(fud))
 		return PTR_ERR(fud);
 
@@ -1720,7 +1728,7 @@ static ssize_t fuse_dev_read(struct kiocb *iocb, struct iov_iter *to)
 
 	fuse_copy_init(&cs, true, to);
 
-	return fuse_dev_do_read(fud, file, &cs, iov_iter_count(to));
+	return fuse_dev_do_read(fud, nonblock, &cs, iov_iter_count(to));
 }
 
 static ssize_t fuse_dev_splice_read(struct file *in, loff_t *ppos,
@@ -1743,7 +1751,7 @@ static ssize_t fuse_dev_splice_read(struct file *in, loff_t *ppos,
 	fuse_copy_init(&cs, true, NULL);
 	cs.pipebufs = bufs;
 	cs.pipe = pipe;
-	ret = fuse_dev_do_read(fud, in, &cs, len);
+	ret = fuse_dev_do_read(fud, in->f_flags & O_NONBLOCK, &cs, len);
 	if (ret < 0)
 		goto out;
 
@@ -2107,10 +2115,19 @@ static __poll_t fuse_dev_poll(struct file *file, poll_table *wait)
 {
 	__poll_t mask = EPOLLOUT | EPOLLWRNORM;
 	struct fuse_iqueue *fiq;
-	struct fuse_dev *fud = fuse_get_dev(file);
+	struct fuse_dev *fud = fuse_file_to_fud(file);
 
-	if (IS_ERR(fud))
-		return EPOLLERR;
+	/*
+	 * Don't block waiting for a sync init mount to attach the device,
+	 * get woken when it does.
+	 */
+	if (!fuse_dev_chan_get(fud)) {
+		if (!fud->sync_init)
+			return EPOLLERR;
+		poll_wait(file, &fuse_dev_waitq, wait);
+		if (!fuse_dev_chan_get(fud))
+			return 0;
+	}
 
 	fiq = &fud->chan->iq;
 	poll_wait(file, &fiq->waitq, wait);

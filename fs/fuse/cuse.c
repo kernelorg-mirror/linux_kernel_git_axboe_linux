@@ -538,6 +538,7 @@ static int cuse_channel_open(struct inode *inode, struct file *file)
 		return rc;
 	}
 	file->private_data = fud;
+	file->f_mode |= FMODE_NOWAIT;
 
 	return 0;
 }
