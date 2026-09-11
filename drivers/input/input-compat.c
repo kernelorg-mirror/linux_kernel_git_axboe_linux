@@ -13,54 +13,6 @@
 
 #ifdef CONFIG_COMPAT
 
-int input_event_from_user(const char __user *buffer,
-			  struct input_event *event)
-{
-	if (in_compat_syscall() && !COMPAT_USE_64BIT_TIME) {
-		struct input_event_compat compat_event;
-
-		if (copy_from_user(&compat_event, buffer,
-				   sizeof(struct input_event_compat)))
-			return -EFAULT;
-
-		event->input_event_sec = compat_event.sec;
-		event->input_event_usec = compat_event.usec;
-		event->type = compat_event.type;
-		event->code = compat_event.code;
-		event->value = compat_event.value;
-
-	} else {
-		if (copy_from_user(event, buffer, sizeof(struct input_event)))
-			return -EFAULT;
-	}
-
-	return 0;
-}
-
-int input_event_to_user(char __user *buffer,
-			const struct input_event *event)
-{
-	if (in_compat_syscall() && !COMPAT_USE_64BIT_TIME) {
-		struct input_event_compat compat_event;
-
-		compat_event.sec = event->input_event_sec;
-		compat_event.usec = event->input_event_usec;
-		compat_event.type = event->type;
-		compat_event.code = event->code;
-		compat_event.value = event->value;
-
-		if (copy_to_user(buffer, &compat_event,
-				 sizeof(struct input_event_compat)))
-			return -EFAULT;
-
-	} else {
-		if (copy_to_user(buffer, event, sizeof(struct input_event)))
-			return -EFAULT;
-	}
-
-	return 0;
-}
-
 int input_event_from_iter(struct iov_iter *from, struct input_event *event)
 {
 	if (in_compat_syscall() && !COMPAT_USE_64BIT_TIME) {
@@ -170,24 +122,6 @@ int input_bits_to_string(char *buf, int buf_size, unsigned long bits,
 
 #else
 
-int input_event_from_user(const char __user *buffer,
-			 struct input_event *event)
-{
-	if (copy_from_user(event, buffer, sizeof(struct input_event)))
-		return -EFAULT;
-
-	return 0;
-}
-
-int input_event_to_user(char __user *buffer,
-			const struct input_event *event)
-{
-	if (copy_to_user(buffer, event, sizeof(struct input_event)))
-		return -EFAULT;
-
-	return 0;
-}
-
 int input_event_from_iter(struct iov_iter *from, struct input_event *event)
 {
 	if (!copy_from_iter_full(event, sizeof(struct input_event), from))
@@ -226,8 +160,6 @@ int input_bits_to_string(char *buf, int buf_size, unsigned long bits,
 
 #endif /* CONFIG_COMPAT */
 
-EXPORT_SYMBOL_GPL(input_event_from_user);
-EXPORT_SYMBOL_GPL(input_event_to_user);
 EXPORT_SYMBOL_GPL(input_event_from_iter);
 EXPORT_SYMBOL_GPL(input_event_to_iter);
 EXPORT_SYMBOL_GPL(input_ff_effect_from_user);
