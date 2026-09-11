@@ -388,7 +388,8 @@ static ssize_t vduse_dev_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			break;
 		spin_unlock(&dev->msg_lock);
 
-		if (file->f_flags & O_NONBLOCK)
+		if (file->f_flags & O_NONBLOCK ||
+		    iocb->ki_flags & IOCB_NOWAIT)
 			return -EAGAIN;
 
 		ret = wait_event_interruptible_exclusive(dev->waitq,
@@ -1930,6 +1931,7 @@ static int vduse_dev_open(struct inode *inode, struct file *file)
 	ret = 0;
 	dev->connected = true;
 	file->private_data = dev;
+	file->f_mode |= FMODE_NOWAIT;
 unlock:
 	mutex_unlock(&dev->lock);
 	mutex_unlock(&vduse_lock);
