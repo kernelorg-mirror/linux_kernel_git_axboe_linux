@@ -15,6 +15,7 @@
 #include <linux/poll.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/uio.h>
 #include <linux/vmalloc.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -486,6 +487,7 @@ static int evdev_open(struct inode *inode, struct file *file)
 
 	file->private_data = client;
 	stream_open(inode, file);
+	file->f_mode |= FMODE_NOWAIT;
 
 	return 0;
 
@@ -495,11 +497,11 @@ static int evdev_open(struct inode *inode, struct file *file)
 	return error;
 }
 
-static ssize_t evdev_write(struct file *file, const char __user *buffer,
-			   size_t count, loff_t *ppos)
+static ssize_t evdev_write(struct kiocb *iocb, struct iov_iter *from)
 {
-	struct evdev_client *client = file->private_data;
+	struct evdev_client *client = iocb->ki_filp->private_data;
 	struct evdev *evdev = client->evdev;
+	size_t count = iov_iter_count(from);
 	struct input_event event;
 	int retval = 0;
 
@@ -524,7 +526,7 @@ static ssize_t evdev_write(struct file *file, const char __user *buffer,
 
 	while (retval + input_event_size() <= count) {
 
-		if (input_event_from_user(buffer + retval, &event)) {
+		if (input_event_from_iter(from, &event)) {
 			retval = -EFAULT;
 			goto out;
 		}
@@ -558,11 +560,14 @@ static int evdev_fetch_next_event(struct evdev_client *client,
 	return have_event;
 }
 
-static ssize_t evdev_read(struct file *file, char __user *buffer,
-			  size_t count, loff_t *ppos)
+static ssize_t evdev_read(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct file *file = iocb->ki_filp;
 	struct evdev_client *client = file->private_data;
 	struct evdev *evdev = client->evdev;
+	bool nonblock = file->f_flags & O_NONBLOCK ||
+			iocb->ki_flags & IOCB_NOWAIT;
+	size_t count = iov_iter_count(to);
 	struct input_event event;
 	size_t read = 0;
 	int error;
@@ -574,8 +579,7 @@ static ssize_t evdev_read(struct file *file, char __user *buffer,
 		if (!evdev->exist || client->revoked)
 			return -ENODEV;
 
-		if (client->packet_head == client->tail &&
-		    (file->f_flags & O_NONBLOCK))
+		if (client->packet_head == client->tail && nonblock)
 			return -EAGAIN;
 
 		/*
@@ -588,7 +592,7 @@ static ssize_t evdev_read(struct file *file, char __user *buffer,
 		while (read + input_event_size() <= count &&
 		       evdev_fetch_next_event(client, &event)) {
 
-			if (input_event_to_user(buffer + read, &event))
+			if (input_event_to_iter(to, &event))
 				return -EFAULT;
 
 			read += input_event_size();
@@ -597,7 +601,7 @@ static ssize_t evdev_read(struct file *file, char __user *buffer,
 		if (read)
 			break;
 
-		if (!(file->f_flags & O_NONBLOCK)) {
+		if (!nonblock) {
 			error = wait_event_interruptible(client->wait,
 					client->packet_head != client->tail ||
 					!evdev->exist || client->revoked);
@@ -1294,8 +1298,8 @@ static long evdev_ioctl_compat(struct file *file,
 
 static const struct file_operations evdev_fops = {
 	.owner		= THIS_MODULE,
-	.read		= evdev_read,
-	.write		= evdev_write,
+	.read_iter	= evdev_read,
+	.write_iter	= evdev_write,
 	.poll		= evdev_poll,
 	.open		= evdev_open,
 	.release	= evdev_release,
