@@ -703,7 +703,7 @@ static const struct memdev {
 	[8] = { "random", &random_fops, FMODE_NOWAIT, 0666 },
 	[9] = { "urandom", &urandom_fops, FMODE_NOWAIT, 0666 },
 #ifdef CONFIG_PRINTK
-	[11] = { "kmsg", &kmsg_fops, 0, 0644 },
+	[11] = { "kmsg", &kmsg_fops, FMODE_NOWAIT, 0644 },
 #endif
 };
 
