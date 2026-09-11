@@ -29,6 +29,7 @@
 #include <linux/string.h>
 
 #include <linux/hidraw.h>
+#include <linux/uio.h>
 
 static int hidraw_major;
 static struct cdev hidraw_cdev;
@@ -43,9 +44,11 @@ static inline bool hidraw_is_revoked(struct hidraw_list *list)
 	return list->revoked;
 }
 
-static ssize_t hidraw_read(struct file *file, char __user *buffer, size_t count, loff_t *ppos)
+static ssize_t hidraw_read(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct file *file = iocb->ki_filp;
 	struct hidraw_list *list = file->private_data;
+	size_t count = iov_iter_count(to);
 	int ret = 0, len;
 	DECLARE_WAITQUEUE(wait, current);
 
@@ -68,7 +71,8 @@ static ssize_t hidraw_read(struct file *file, char __user *buffer, size_t count,
 					ret = -EIO;
 					break;
 				}
-				if (file->f_flags & O_NONBLOCK) {
+				if (file->f_flags & O_NONBLOCK ||
+				    iocb->ki_flags & IOCB_NOWAIT) {
 					ret = -EAGAIN;
 					break;
 				}
@@ -91,7 +95,7 @@ static ssize_t hidraw_read(struct file *file, char __user *buffer, size_t count,
 			count : list->buffer[list->tail].len;
 
 		if (list->buffer[list->tail].value) {
-			if (copy_to_user(buffer, list->buffer[list->tail].value, len)) {
+			if (copy_to_iter(list->buffer[list->tail].value, len, to) != len) {
 				ret = -EFAULT;
 				goto out;
 			}
@@ -319,6 +323,7 @@ static int hidraw_open(struct inode *inode, struct file *file)
 	list_add_tail(&list->node, &hidraw_table[minor]->list);
 	spin_unlock_irqrestore(&hidraw_table[minor]->list_lock, flags);
 	file->private_data = list;
+	file->f_mode |= FMODE_NOWAIT;
 out_unlock:
 	up_write(&minors_rwsem);
 out:
@@ -556,7 +561,7 @@ out:
 
 static const struct file_operations hidraw_ops = {
 	.owner =        THIS_MODULE,
-	.read =         hidraw_read,
+	.read_iter =    hidraw_read,
 	.write =        hidraw_write,
 	.poll =         hidraw_poll,
 	.open =         hidraw_open,
