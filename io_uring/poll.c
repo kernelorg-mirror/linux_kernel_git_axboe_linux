@@ -712,6 +712,9 @@ int io_arm_poll_handler(struct io_kiocb *req, unsigned issue_flags)
 		return IO_APOLL_ABORTED;
 	if (!io_file_can_poll(req))
 		return IO_APOLL_ABORTED;
+	/* readiness doesn't help this request, see io_file_supports_nowait() */
+	if (req->flags & REQ_F_NO_APOLL)
+		return IO_APOLL_ABORTED;
 
 	if (def->pollin) {
 		mask |= EPOLLIN | EPOLLRDNORM;

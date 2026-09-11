@@ -34,8 +34,22 @@ struct io_rw {
 	rwf_t				flags;
 };
 
-static bool io_file_supports_nowait(struct io_kiocb *req, __poll_t mask)
+static bool io_file_supports_nowait(struct io_kiocb *req, int ddir,
+				    __poll_t mask)
 {
+	const struct file_operations *fops = req->file->f_op;
+
+	/*
+	 * Without ->read_iter or ->write_iter, the IO goes through
+	 * loop_rw_iter(), which can't do a nonblocking attempt unless the
+	 * file is O_NONBLOCK. The file being ready doesn't change that, so
+	 * don't arm poll for it either, have io-wq do it right away.
+	 */
+	if (!(ddir == READ ? fops->read_iter : fops->write_iter) &&
+	    !(req->file->f_flags & O_NONBLOCK)) {
+		req->flags |= REQ_F_NO_APOLL;
+		return false;
+	}
 	/* If FMODE_NOWAIT is set for a file, we're golden */
 	if (req->flags & REQ_F_SUPPORT_NOWAIT)
 		return true;
@@ -936,7 +950,7 @@ static int __io_read(struct io_kiocb *req, struct io_br_sel *sel,
 
 	if (force_nonblock) {
 		/* If the file doesn't support async, just async punt */
-		if (unlikely(!io_file_supports_nowait(req, EPOLLIN)))
+		if (unlikely(!io_file_supports_nowait(req, READ, EPOLLIN)))
 			return -EAGAIN;
 		kiocb->ki_flags |= IOCB_NOWAIT;
 	} else {
@@ -1149,7 +1163,7 @@ int io_write(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (force_nonblock) {
 		/* If the file doesn't support async, just async punt */
-		if (unlikely(!io_file_supports_nowait(req, EPOLLOUT)))
+		if (unlikely(!io_file_supports_nowait(req, WRITE, EPOLLOUT)))
 			goto ret_eagain;
 
 		/* Check if we can support NOWAIT. */
