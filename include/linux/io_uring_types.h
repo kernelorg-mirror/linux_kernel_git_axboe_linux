@@ -619,6 +619,7 @@ enum {
 	REQ_F_SQE_COPIED_BIT,
 	REQ_F_IOPOLL_BIT,
 	REQ_F_DMABUF_BIT,
+	REQ_F_NO_APOLL_BIT,
 
 	/* not a real bit, just to check we're not overflowing the space */
 	__REQ_F_LAST_BIT,
@@ -716,6 +717,8 @@ enum {
 	REQ_F_IOPOLL		= IO_REQ_FLAG(REQ_F_IOPOLL_BIT),
 	/* there is a dma map attached to request that needs to be dropped */
 	REQ_F_DMABUF		= IO_REQ_FLAG(REQ_F_DMABUF_BIT),
+	/* don't arm async poll, the request can only make progress from io-wq */
+	REQ_F_NO_APOLL		= IO_REQ_FLAG(REQ_F_NO_APOLL_BIT),
 };
 
 struct io_tw_req {
