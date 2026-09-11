@@ -833,7 +833,7 @@ static void tty_update_time(struct tty_struct *tty, bool mtime)
  * ldisc maintains state for and needs to free.
  */
 static ssize_t iterate_tty_read(struct tty_ldisc *ld, struct tty_struct *tty,
-				struct file *file, struct iov_iter *to)
+				struct kiocb *iocb, struct iov_iter *to)
 {
 	void *cookie = NULL;
 	unsigned long offset = 0;
@@ -844,7 +844,7 @@ static ssize_t iterate_tty_read(struct tty_ldisc *ld, struct tty_struct *tty,
 	do {
 		ssize_t size = min(count, sizeof(kernel_buf));
 
-		size = ld->ops->read(tty, file, kernel_buf, size, &cookie, offset);
+		size = ld->ops->read(tty, iocb, kernel_buf, size, &cookie, offset);
 		if (!size)
 			break;
 
@@ -919,7 +919,7 @@ static ssize_t tty_read(struct kiocb *iocb, struct iov_iter *to)
 		return hung_up_tty_read(iocb, to);
 	ret = -EIO;
 	if (ld->ops->read)
-		ret = iterate_tty_read(ld, tty, file, to);
+		ret = iterate_tty_read(ld, tty, iocb, to);
 	tty_ldisc_deref(ld);
 
 	if (ret > 0)
@@ -950,12 +950,12 @@ int tty_write_lock(struct tty_struct *tty, bool ndelay)
  * denial-of-service type attacks
  */
 static ssize_t iterate_tty_write(struct tty_ldisc *ld, struct tty_struct *tty,
-				 struct file *file, struct iov_iter *from)
+				 struct kiocb *iocb, struct iov_iter *from)
 {
 	size_t chunk, count = iov_iter_count(from);
 	ssize_t ret, written = 0;
 
-	ret = tty_write_lock(tty, file->f_flags & O_NDELAY);
+	ret = tty_write_lock(tty, iocb->ki_filp->f_flags & O_NDELAY);
 	if (ret < 0)
 		return ret;
 
@@ -1003,7 +1003,7 @@ static ssize_t iterate_tty_write(struct tty_ldisc *ld, struct tty_struct *tty,
 		if (copy_from_iter(tty->write_buf, size, from) != size)
 			break;
 
-		ret = ld->ops->write(tty, file, tty->write_buf, size);
+		ret = ld->ops->write(tty, iocb, tty->write_buf, size);
 		if (ret <= 0)
 			break;
 
@@ -1032,8 +1032,9 @@ out:
 	return ret;
 }
 
-static ssize_t file_tty_write(struct file *file, struct kiocb *iocb, struct iov_iter *from)
+static ssize_t file_tty_write(struct kiocb *iocb, struct iov_iter *from)
 {
+	struct file *file = iocb->ki_filp;
 	struct tty_struct *tty = file_tty(file);
 	struct tty_ldisc *ld;
 	ssize_t ret;
@@ -1051,7 +1052,7 @@ static ssize_t file_tty_write(struct file *file, struct kiocb *iocb, struct iov_
 	if (!ld->ops->write)
 		ret = -EIO;
 	else
-		ret = iterate_tty_write(ld, tty, file, from);
+		ret = iterate_tty_write(ld, tty, iocb, from);
 	tty_ldisc_deref(ld);
 	return ret;
 }
@@ -1072,7 +1073,7 @@ static ssize_t file_tty_write(struct file *file, struct kiocb *iocb, struct iov_
  */
 static ssize_t tty_write(struct kiocb *iocb, struct iov_iter *from)
 {
-	return file_tty_write(iocb->ki_filp, iocb, from);
+	return file_tty_write(iocb, from);
 }
 
 ssize_t redirected_tty_write(struct kiocb *iocb, struct iov_iter *iter)
@@ -1089,9 +1090,11 @@ ssize_t redirected_tty_write(struct kiocb *iocb, struct iov_iter *iter)
 	 * call file_tty_write() directly with that file pointer.
 	 */
 	if (p) {
+		struct kiocb riocb = *iocb;
 		ssize_t res;
 
-		res = file_tty_write(p, iocb, iter);
+		riocb.ki_filp = p;
+		res = file_tty_write(&riocb, iter);
 		fput(p);
 		return res;
 	}
