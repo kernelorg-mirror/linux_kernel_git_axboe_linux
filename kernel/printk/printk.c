@@ -798,22 +798,30 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 	return ret;
 }
 
-static ssize_t devkmsg_read(struct file *file, char __user *buf,
-			    size_t count, loff_t *ppos)
+static ssize_t devkmsg_read(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct file *file = iocb->ki_filp;
 	struct devkmsg_user *user = file->private_data;
 	char *outbuf = &user->pbufs.outbuf[0];
 	struct printk_message pmsg = {
 		.pbufs = &user->pbufs,
 	};
+	bool nonblock = file->f_flags & O_NONBLOCK ||
+			iocb->ki_flags & IOCB_NOWAIT;
 	ssize_t ret;
 
-	ret = mutex_lock_interruptible(&user->lock);
-	if (ret)
-		return ret;
+	/* a blocking reader holds the lock while waiting for a record */
+	if (nonblock) {
+		if (!mutex_trylock(&user->lock))
+			return -EAGAIN;
+	} else {
+		ret = mutex_lock_interruptible(&user->lock);
+		if (ret)
+			return ret;
+	}
 
 	if (!printk_get_next_message(&pmsg, atomic64_read(&user->seq), true, false)) {
-		if (file->f_flags & O_NONBLOCK) {
+		if (nonblock) {
 			ret = -EAGAIN;
 			goto out;
 		}
@@ -844,12 +852,12 @@ static ssize_t devkmsg_read(struct file *file, char __user *buf,
 
 	atomic64_set(&user->seq, pmsg.seq + 1);
 
-	if (pmsg.outbuf_len > count) {
+	if (pmsg.outbuf_len > iov_iter_count(to)) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	if (copy_to_user(buf, outbuf, pmsg.outbuf_len)) {
+	if (copy_to_iter(outbuf, pmsg.outbuf_len, to) != pmsg.outbuf_len) {
 		ret = -EFAULT;
 		goto out;
 	}
@@ -961,7 +969,7 @@ static int devkmsg_release(struct inode *inode, struct file *file)
 
 const struct file_operations kmsg_fops = {
 	.open = devkmsg_open,
-	.read = devkmsg_read,
+	.read_iter = devkmsg_read,
 	.write_iter = devkmsg_write,
 	.llseek = devkmsg_llseek,
 	.poll = devkmsg_poll,
