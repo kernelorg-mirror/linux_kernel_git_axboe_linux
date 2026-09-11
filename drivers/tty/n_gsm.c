@@ -3733,10 +3733,7 @@ static void gsmld_write_wakeup(struct tty_struct *tty)
  *	gsmld_read		-	read function for tty
  *	@tty: tty device
  *	@iocb: the read's kiocb
- *	@buf: userspace buffer pointer
- *	@nr: size of I/O
- *	@cookie: unused
- *	@offset: unused
+ *	@to: destination
  *
  *	Perform reads for the line discipline. We are guaranteed that the
  *	line discipline will not be closed under us but we may get multiple
@@ -3746,8 +3743,8 @@ static void gsmld_write_wakeup(struct tty_struct *tty)
  *	This code must be sure never to sleep through a hangup.
  */
 
-static ssize_t gsmld_read(struct tty_struct *tty, struct kiocb *iocb, u8 *buf,
-			  size_t nr, void **cookie, unsigned long offset)
+static ssize_t gsmld_read(struct tty_struct *tty, struct kiocb *iocb,
+			  struct iov_iter *to)
 {
 	return -EOPNOTSUPP;
 }
