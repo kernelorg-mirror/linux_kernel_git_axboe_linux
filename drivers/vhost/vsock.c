@@ -733,6 +733,7 @@ static int vhost_vsock_dev_open(struct inode *inode, struct file *file)
 		       VHOST_VSOCK_WEIGHT, true, NULL);
 
 	file->private_data = vsock;
+	file->f_mode |= FMODE_NOWAIT;
 	skb_queue_head_init(&vsock->send_pkt_queue);
 	vhost_work_init(&vsock->send_pkt_work, vhost_transport_send_pkt_work);
 	return 0;
@@ -948,7 +949,8 @@ static ssize_t vhost_vsock_chr_read_iter(struct kiocb *iocb, struct iov_iter *to
 	struct file *file = iocb->ki_filp;
 	struct vhost_vsock *vsock = file->private_data;
 	struct vhost_dev *dev = &vsock->dev;
-	int noblock = file->f_flags & O_NONBLOCK;
+	int noblock = file->f_flags & O_NONBLOCK ||
+		      iocb->ki_flags & IOCB_NOWAIT;
 
 	return vhost_chr_read_iter(dev, to, noblock);
 }
