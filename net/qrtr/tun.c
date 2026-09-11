@@ -43,6 +43,7 @@ static int qrtr_tun_open(struct inode *inode, struct file *filp)
 	tun->ep.xmit = qrtr_tun_send;
 
 	filp->private_data = tun;
+	filp->f_mode |= FMODE_NOWAIT;
 
 	ret = qrtr_endpoint_register(&tun->ep, QRTR_EP_NID_AUTO);
 	if (ret)
@@ -64,7 +65,8 @@ static ssize_t qrtr_tun_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	int count;
 
 	while (!(skb = skb_dequeue(&tun->queue))) {
-		if (filp->f_flags & O_NONBLOCK)
+		if (filp->f_flags & O_NONBLOCK ||
+		    iocb->ki_flags & IOCB_NOWAIT)
 			return -EAGAIN;
 
 		/* Wait until we get data or the endpoint goes away */
