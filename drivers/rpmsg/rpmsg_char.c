@@ -182,6 +182,7 @@ static int rpmsg_eptdev_open(struct inode *inode, struct file *filp)
 	ept->flow_cb = rpmsg_ept_flow_cb;
 	eptdev->ept = ept;
 	filp->private_data = eptdev;
+	filp->f_mode |= FMODE_NOWAIT;
 	mutex_unlock(&eptdev->ept_lock);
 
 	return 0;
@@ -227,7 +228,8 @@ static ssize_t rpmsg_eptdev_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	if (skb_queue_empty(&eptdev->queue)) {
 		spin_unlock_irqrestore(&eptdev->queue_lock, flags);
 
-		if (filp->f_flags & O_NONBLOCK)
+		if (filp->f_flags & O_NONBLOCK ||
+		    iocb->ki_flags & IOCB_NOWAIT)
 			return -EAGAIN;
 
 		/* Wait until we get data or the endpoint goes away */
@@ -263,6 +265,8 @@ static ssize_t rpmsg_eptdev_write_iter(struct kiocb *iocb,
 	struct file *filp = iocb->ki_filp;
 	struct rpmsg_eptdev *eptdev = filp->private_data;
 	size_t len = iov_iter_count(from);
+	bool nonblock = filp->f_flags & O_NONBLOCK ||
+			iocb->ki_flags & IOCB_NOWAIT;
 	void *kbuf;
 	int ret;
 
@@ -275,7 +279,13 @@ static ssize_t rpmsg_eptdev_write_iter(struct kiocb *iocb,
 		goto free_kbuf;
 	}
 
-	if (mutex_lock_interruptible(&eptdev->ept_lock)) {
+	/* a blocking writer holds ept_lock while waiting for a tx buffer */
+	if (nonblock) {
+		if (!mutex_trylock(&eptdev->ept_lock)) {
+			ret = -EAGAIN;
+			goto free_kbuf;
+		}
+	} else if (mutex_lock_interruptible(&eptdev->ept_lock)) {
 		ret = -ERESTARTSYS;
 		goto free_kbuf;
 	}
@@ -285,7 +295,7 @@ static ssize_t rpmsg_eptdev_write_iter(struct kiocb *iocb,
 		goto unlock_eptdev;
 	}
 
-	if (filp->f_flags & O_NONBLOCK) {
+	if (nonblock) {
 		ret = rpmsg_trysendto(eptdev->ept, kbuf, len, eptdev->chinfo.dst);
 		if (ret == -ENOMEM)
 			ret = -EAGAIN;
