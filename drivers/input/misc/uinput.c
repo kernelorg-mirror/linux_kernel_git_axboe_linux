@@ -30,6 +30,7 @@
 #include <linux/overflow.h>
 #include <linux/spinlock.h>
 #include <linux/input/mt.h>
+#include <linux/uio.h>
 #include "../input-compat.h"
 
 #define UINPUT_NAME		"uinput"
@@ -412,6 +413,7 @@ static int uinput_open(struct inode *inode, struct file *file)
 
 	file->private_data = newdev;
 	stream_open(inode, file);
+	file->f_mode |= FMODE_NOWAIT;
 
 	return 0;
 }
@@ -543,8 +545,9 @@ static int uinput_abs_setup(struct uinput_device *udev,
 
 /* legacy setup via write() */
 static int uinput_setup_device_legacy(struct uinput_device *udev,
-				      const char __user *buffer, size_t count)
+				      struct iov_iter *from)
 {
+	size_t count = iov_iter_count(from);
 	struct uinput_user_dev	*user_dev;
 	struct input_dev	*dev;
 	int			i;
@@ -561,9 +564,13 @@ static int uinput_setup_device_legacy(struct uinput_device *udev,
 
 	dev = udev->dev;
 
-	user_dev = memdup_user(buffer, sizeof(struct uinput_user_dev));
-	if (IS_ERR(user_dev))
-		return PTR_ERR(user_dev);
+	user_dev = kmalloc_obj(*user_dev);
+	if (!user_dev)
+		return -ENOMEM;
+	if (!copy_from_iter_full(user_dev, sizeof(*user_dev), from)) {
+		kfree(user_dev);
+		return -EFAULT;
+	}
 
 	udev->ff_effects_max = user_dev->ff_effects_max;
 
@@ -634,8 +641,9 @@ static bool is_valid_timestamp(const ktime_t timestamp)
 }
 
 static ssize_t uinput_inject_events(struct uinput_device *udev,
-				    const char __user *buffer, size_t count)
+				    struct iov_iter *from)
 {
+	size_t count = iov_iter_count(from);
 	struct input_event ev;
 	size_t bytes = 0;
 	ktime_t timestamp;
@@ -650,7 +658,7 @@ static ssize_t uinput_inject_events(struct uinput_device *udev,
 		 * count to let userspace know that it got it's buffers
 		 * all wrong.
 		 */
-		if (input_event_from_user(buffer + bytes, &ev))
+		if (input_event_from_iter(from, &ev))
 			return -EFAULT;
 
 		timestamp = ktime_set(ev.input_event_sec, ev.input_event_usec * NSEC_PER_USEC);
@@ -665,13 +673,12 @@ static ssize_t uinput_inject_events(struct uinput_device *udev,
 	return bytes;
 }
 
-static ssize_t uinput_write(struct file *file, const char __user *buffer,
-			    size_t count, loff_t *ppos)
+static ssize_t uinput_write(struct kiocb *iocb, struct iov_iter *from)
 {
-	struct uinput_device *udev = file->private_data;
+	struct uinput_device *udev = iocb->ki_filp->private_data;
 	int retval;
 
-	if (count == 0)
+	if (iov_iter_count(from) == 0)
 		return 0;
 
 	retval = mutex_lock_interruptible(&udev->mutex);
@@ -679,8 +686,8 @@ static ssize_t uinput_write(struct file *file, const char __user *buffer,
 		return retval;
 
 	retval = udev->state == UIST_CREATED ?
-			uinput_inject_events(udev, buffer, count) :
-			uinput_setup_device_legacy(udev, buffer, count);
+			uinput_inject_events(udev, from) :
+			uinput_setup_device_legacy(udev, from);
 
 	mutex_unlock(&udev->mutex);
 
@@ -706,15 +713,16 @@ static bool uinput_fetch_next_event(struct uinput_device *udev,
 }
 
 static ssize_t uinput_events_to_user(struct uinput_device *udev,
-				     char __user *buffer, size_t count)
+				     struct iov_iter *to)
 {
+	size_t count = iov_iter_count(to);
 	struct input_event event;
 	size_t read = 0;
 
 	while (read + input_event_size() <= count &&
 	       uinput_fetch_next_event(udev, &event)) {
 
-		if (input_event_to_user(buffer + read, &event))
+		if (input_event_to_iter(to, &event))
 			return -EFAULT;
 
 		read += input_event_size();
@@ -723,10 +731,13 @@ static ssize_t uinput_events_to_user(struct uinput_device *udev,
 	return read;
 }
 
-static ssize_t uinput_read(struct file *file, char __user *buffer,
-			   size_t count, loff_t *ppos)
+static ssize_t uinput_read(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct file *file = iocb->ki_filp;
 	struct uinput_device *udev = file->private_data;
+	bool nonblock = file->f_flags & O_NONBLOCK ||
+			iocb->ki_flags & IOCB_NOWAIT;
+	size_t count = iov_iter_count(to);
 	ssize_t retval;
 
 	if (count != 0 && count < input_event_size())
@@ -739,18 +750,17 @@ static ssize_t uinput_read(struct file *file, char __user *buffer,
 
 		if (udev->state != UIST_CREATED)
 			retval = -ENODEV;
-		else if (udev->head == udev->tail &&
-			 (file->f_flags & O_NONBLOCK))
+		else if (udev->head == udev->tail && nonblock)
 			retval = -EAGAIN;
 		else
-			retval = uinput_events_to_user(udev, buffer, count);
+			retval = uinput_events_to_user(udev, to);
 
 		mutex_unlock(&udev->mutex);
 
 		if (retval || count == 0)
 			break;
 
-		if (!(file->f_flags & O_NONBLOCK))
+		if (!nonblock)
 			retval = wait_event_interruptible(udev->waitq,
 						  udev->head != udev->tail ||
 						  udev->state != UIST_CREATED);
@@ -1147,8 +1157,8 @@ static const struct file_operations uinput_fops = {
 	.owner		= THIS_MODULE,
 	.open		= uinput_open,
 	.release	= uinput_release,
-	.read		= uinput_read,
-	.write		= uinput_write,
+	.read_iter	= uinput_read,
+	.write_iter	= uinput_write,
 	.poll		= uinput_poll,
 	.unlocked_ioctl	= uinput_ioctl,
 #ifdef CONFIG_COMPAT

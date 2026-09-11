@@ -66,12 +66,6 @@ static inline size_t input_event_size(void)
 
 #endif /* CONFIG_COMPAT */
 
-int input_event_from_user(const char __user *buffer,
-			 struct input_event *event);
-
-int input_event_to_user(char __user *buffer,
-			const struct input_event *event);
-
 struct iov_iter;
 
 int input_event_from_iter(struct iov_iter *from, struct input_event *event);
