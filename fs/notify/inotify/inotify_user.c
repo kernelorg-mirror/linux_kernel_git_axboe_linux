@@ -28,6 +28,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/uaccess.h>
 #include <linux/poll.h>
+#include <linux/uio.h>
 #include <linux/wait.h>
 #include <linux/memcontrol.h>
 #include <linux/security.h>
@@ -198,7 +199,7 @@ static struct fsnotify_event *get_one_event(struct fsnotify_group *group,
  */
 static ssize_t copy_event_to_user(struct fsnotify_group *group,
 				  struct fsnotify_event *fsn_event,
-				  char __user *buf)
+				  struct iov_iter *to)
 {
 	struct inotify_event inotify_event;
 	struct inotify_event_info *event;
@@ -221,10 +222,8 @@ static ssize_t copy_event_to_user(struct fsnotify_group *group,
 	inotify_event.cookie = event->sync_cookie;
 
 	/* send the main event */
-	if (copy_to_user(buf, &inotify_event, event_size))
+	if (copy_to_iter(&inotify_event, event_size, to) != event_size)
 		return -EFAULT;
-
-	buf += event_size;
 
 	/*
 	 * fsnotify only stores the pathname, so here we have to send the pathname
@@ -233,12 +232,12 @@ static ssize_t copy_event_to_user(struct fsnotify_group *group,
 	 */
 	if (pad_name_len) {
 		/* copy the path name */
-		if (copy_to_user(buf, event->name, name_len))
+		if (copy_to_iter(event->name, name_len, to) != name_len)
 			return -EFAULT;
-		buf += name_len;
 
 		/* fill userspace with 0's */
-		if (clear_user(buf, pad_name_len - name_len))
+		if (iov_iter_zero(pad_name_len - name_len, to) !=
+		    pad_name_len - name_len)
 			return -EFAULT;
 		event_size += pad_name_len;
 	}
@@ -246,22 +245,21 @@ static ssize_t copy_event_to_user(struct fsnotify_group *group,
 	return event_size;
 }
 
-static ssize_t inotify_read(struct file *file, char __user *buf,
-			    size_t count, loff_t *pos)
+static ssize_t inotify_read(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct file *file = iocb->ki_filp;
 	struct fsnotify_group *group;
 	struct fsnotify_event *kevent;
-	char __user *start;
+	size_t done = 0;
 	int ret;
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 
-	start = buf;
 	group = file->private_data;
 
 	add_wait_queue(&group->notification_waitq, &wait);
 	while (1) {
 		spin_lock(&group->notification_lock);
-		kevent = get_one_event(group, count);
+		kevent = get_one_event(group, iov_iter_count(to));
 		spin_unlock(&group->notification_lock);
 
 		pr_debug("%s: group=%p kevent=%p\n", __func__, group, kevent);
@@ -270,31 +268,30 @@ static ssize_t inotify_read(struct file *file, char __user *buf,
 			ret = PTR_ERR(kevent);
 			if (IS_ERR(kevent))
 				break;
-			ret = copy_event_to_user(group, kevent, buf);
+			ret = copy_event_to_user(group, kevent, to);
 			fsnotify_destroy_event(group, kevent);
 			if (ret < 0)
 				break;
-			buf += ret;
-			count -= ret;
+			done += ret;
 			continue;
 		}
 
 		ret = -EAGAIN;
-		if (file->f_flags & O_NONBLOCK)
+		if (file->f_flags & O_NONBLOCK || iocb->ki_flags & IOCB_NOWAIT)
 			break;
 		ret = -ERESTARTSYS;
 		if (signal_pending(current))
 			break;
 
-		if (start != buf)
+		if (done)
 			break;
 
 		wait_woken(&wait, TASK_INTERRUPTIBLE, MAX_SCHEDULE_TIMEOUT);
 	}
 	remove_wait_queue(&group->notification_waitq, &wait);
 
-	if (start != buf && ret != -EFAULT)
-		ret = buf - start;
+	if (done && ret != -EFAULT)
+		ret = done;
 	return ret;
 }
 
@@ -357,7 +354,7 @@ static long inotify_ioctl(struct file *file, unsigned int cmd,
 static const struct file_operations inotify_fops = {
 	.show_fdinfo	= inotify_show_fdinfo,
 	.poll		= inotify_poll,
-	.read		= inotify_read,
+	.read_iter	= inotify_read,
 	.fasync		= fsnotify_fasync,
 	.release	= inotify_release,
 	.unlocked_ioctl	= inotify_ioctl,
@@ -682,7 +679,6 @@ static struct fsnotify_group *inotify_new_group(unsigned int max_events)
 static int do_inotify_init(int flags)
 {
 	struct fsnotify_group *group;
-	int ret;
 
 	/* Check the IN_* constants for consistency.  */
 	BUILD_BUG_ON(IN_CLOEXEC != O_CLOEXEC);
@@ -696,12 +692,15 @@ static int do_inotify_init(int flags)
 	if (IS_ERR(group))
 		return PTR_ERR(group);
 
-	ret = anon_inode_getfd("inotify", &inotify_fops, group,
-				  O_RDONLY | flags);
-	if (ret < 0)
+	FD_PREPARE(fdf, O_RDONLY | flags,
+		   anon_inode_getfile_fmode("inotify", &inotify_fops, group,
+					    O_RDONLY | flags, FMODE_NOWAIT));
+	if (fdf.err) {
 		fsnotify_destroy_group(group);
+		return fdf.err;
+	}
 
-	return ret;
+	return fd_publish(fdf);
 }
 
 SYSCALL_DEFINE1(inotify_init1, int, flags)
