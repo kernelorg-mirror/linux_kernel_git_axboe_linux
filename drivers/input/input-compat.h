@@ -72,6 +72,12 @@ int input_event_from_user(const char __user *buffer,
 int input_event_to_user(char __user *buffer,
 			const struct input_event *event);
 
+struct iov_iter;
+
+int input_event_from_iter(struct iov_iter *from, struct input_event *event);
+
+int input_event_to_iter(struct iov_iter *to, const struct input_event *event);
+
 int input_ff_effect_from_user(const char __user *buffer, size_t size,
 			      struct ff_effect *effect);
 
