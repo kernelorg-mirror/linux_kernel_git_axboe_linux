@@ -1398,6 +1398,7 @@ static int vhost_net_open(struct inode *inode, struct file *f)
 			vqs[VHOST_NET_VQ_RX]);
 
 	f->private_data = n;
+	f->f_mode |= FMODE_NOWAIT;
 	page_frag_cache_init(&n->pf_cache);
 
 	return 0;
@@ -1852,7 +1853,8 @@ static ssize_t vhost_net_chr_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct file *file = iocb->ki_filp;
 	struct vhost_net *n = file->private_data;
 	struct vhost_dev *dev = &n->dev;
-	int noblock = file->f_flags & O_NONBLOCK;
+	int noblock = file->f_flags & O_NONBLOCK ||
+		      iocb->ki_flags & IOCB_NOWAIT;
 
 	return vhost_chr_read_iter(dev, to, noblock);
 }
