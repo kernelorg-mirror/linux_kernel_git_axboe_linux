@@ -996,11 +996,6 @@ static bool thread_handoff_task_ok(struct task_struct *tsk)
 	/* I/O permissions, the bitmap hangs off the task */
 	if (test_tsk_thread_flag(tsk, TIF_IO_BITMAP) || tsk->thread.iopl_emul)
 		return false;
-#ifdef CONFIG_X86_USER_SHADOW_STACK
-	/* the shadow stack is per-thread and would have to move along */
-	if (tsk->thread.features & ARCH_SHSTK_SHSTK)
-		return false;
-#endif
 	/* only the default sized FPU state gets copied over, no AMX */
 	if (x86_task_fpu(tsk)->fpstate->is_valloc)
 		return false;
@@ -1081,6 +1076,12 @@ int arch_thread_handoff_finish(struct task_struct *src, bool leader)
 	dst_fpu->last_cpu = -1;
 	set_thread_flag(TIF_NEED_FPU_LOAD);
 	fpregs_unlock();
+
+#ifdef CONFIG_X86_USER_SHADOW_STACK
+	swap(t->shstk, s->shstk);
+	swap(t->features, s->features);
+	swap(t->features_locked, s->features_locked);
+#endif
 
 	preempt_disable();
 
