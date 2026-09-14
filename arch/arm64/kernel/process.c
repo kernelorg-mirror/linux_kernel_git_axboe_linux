@@ -1014,9 +1014,6 @@ static bool thread_handoff_task_ok(struct task_struct *tsk)
 {
 	if (is_compat_thread(task_thread_info(tsk)))
 		return false;
-	/* the GCS is per-thread and would have to move along */
-	if (task_gcs_el0_enabled(tsk))
-		return false;
 	/* counter-timer trapping doesn't move, see update_cntkctl_el1() */
 	if (test_tsk_thread_flag(tsk, TIF_TSC_SIGSEGV))
 		return false;
@@ -1041,6 +1038,7 @@ bool arch_thread_handoff_prepare(void)
 
 	fpsimd_preserve_current_state();
 	tls_preserve_current_state();
+	gcs_preserve_current_state();
 	if (system_supports_poe())
 		thread->por_el0 = read_sysreg_s(SYS_POR_EL0);
 
@@ -1107,6 +1105,24 @@ int arch_thread_handoff_finish(struct task_struct *src, bool leader)
 	ptrauth_thread_switch_user(dst);
 	mte_thread_switch(dst);
 	update_sctlr_el1(dst->thread.sctlr_user);
+
+#ifdef CONFIG_ARM64_GCS
+	/*
+	 * The GCS belongs with the user stack. Same ordering as
+	 * gcs_thread_switch()
+	 */
+	if (system_supports_gcs()) {
+		swap(dst->thread.gcs_base, src->thread.gcs_base);
+		swap(dst->thread.gcs_size, src->thread.gcs_size);
+		swap(dst->thread.gcspr_el0, src->thread.gcspr_el0);
+		swap(dst->thread.gcs_el0_mode, src->thread.gcs_el0_mode);
+		swap(dst->thread.gcs_el0_locked, src->thread.gcs_el0_locked);
+		write_sysreg_s(dst->thread.gcspr_el0, SYS_GCSPR_EL0);
+		gcs_set_el0_mode(dst);
+		if (task_gcs_el0_enabled(dst) || task_gcs_el0_enabled(src))
+			gcsb_dsync();
+	}
+#endif
 
 	preempt_enable();
 	return 0;
