@@ -1139,6 +1139,8 @@ void io_wq_handoff_commit(struct task_struct *dst)
 	put_task_struct(src);
 
 	atomic_set_release(&worker->handoff, IO_WORKER_HANDOFF_DONE);
+	/* wake_up_var() checks for waiters, order the store before that */
+	smp_mb();
 	wake_up_var(&worker->handoff);
 }
 
@@ -1173,6 +1175,8 @@ void io_wq_handoff_finished(struct task_struct *tsk)
 	struct io_worker *worker = tsk->worker_private;
 
 	atomic_set_release(&worker->handoff, IO_WORKER_HANDOFF_FINISHED);
+	/* wake_up_var() checks for waiters, order the store before that */
+	smp_mb();
 	wake_up_var(&worker->handoff);
 }
 
