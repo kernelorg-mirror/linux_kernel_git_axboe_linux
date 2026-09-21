@@ -4623,6 +4623,12 @@ int wake_up_process(struct task_struct *p)
 }
 EXPORT_SYMBOL(wake_up_process);
 
+/* wake @p on this CPU if its affinity allows, the caller is about to sleep */
+int wake_up_process_sync(struct task_struct *p)
+{
+	return try_to_wake_up(p, TASK_NORMAL, WF_SYNC | WF_CURRENT_CPU);
+}
+
 int wake_up_state(struct task_struct *p, unsigned int state)
 {
 	return try_to_wake_up(p, state, 0);
@@ -7454,6 +7460,12 @@ static inline void sched_submit_work(struct task_struct *tsk)
 	/*
 	 * If a worker goes to sleep, notify and ask workqueue whether it
 	 * wants to wake up a task to maintain concurrency.
+	 *
+	 * The else-if order is intentional: a task with both PF_IO_WORKER
+	 * and PF_IO_HANDOFF is already demoted, it has no identity left
+	 * to hand off, so it takes the worker path. A promoted task has
+	 * PF_IO_WORKER cleared in io_wq_worker_promoted(), so its next
+	 * block reaches io_uring_task_sleeping().
 	 */
 	if (task_flags & PF_WQ_WORKER)
 		wq_worker_sleeping(tsk);
