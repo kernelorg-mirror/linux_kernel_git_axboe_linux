@@ -141,7 +141,7 @@ static const struct ctl_table kernel_io_uring_disabled_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
-		.extra2		= SYSCTL_ONE,
+		.extra2		= SYSCTL_TWO,
 	},
 #endif
 	{
@@ -473,6 +473,30 @@ void io_queue_iowq(struct io_kiocb *req)
 
 	trace_io_uring_queue_async_work(req, io_wq_is_hashed(&req->work));
 	io_wq_enqueue(tctx->io_wq, &req->work);
+}
+
+/*
+ * Like io_queue_iowq(), but an idle worker runs @req right away while we wait
+ * for it to finish or block. Without an idle worker it's a plain punt.
+ */
+static void io_queue_iowq_sync(struct io_kiocb *req)
+{
+	struct io_uring_task *tctx = req->tctx;
+	bool bound = !io_req_unbound(req);
+	int state = IO_WQ_SYNC_NONE;
+
+	io_prep_async_link(req);
+	/* hashed work serializes through the acct, only the queue does that */
+	if (!io_wq_is_hashed(&req->work))
+		state = io_wq_sync_issue(tctx->io_wq, &req->work, bound);
+	if (state == IO_WQ_SYNC_NONE) {
+		trace_io_uring_queue_async_work(req, io_wq_is_hashed(&req->work));
+		io_wq_enqueue(tctx->io_wq, &req->work);
+		return;
+	}
+	/* the worker is busy for a while, keep a spare around */
+	if (state == IO_WQ_SYNC_BLOCKED)
+		io_wq_handoff_spare(tctx->io_wq, bound, true);
 }
 
 unsigned io_linked_nr(struct io_kiocb *req)
@@ -1522,6 +1546,12 @@ static int io_issue_sqe(struct io_kiocb *req, unsigned int issue_flags)
 
 	if (unlikely(!io_assign_file(req, def, issue_flags)))
 		return -EBADF;
+
+	/* a worker issues it while we wait, the request is its from here */
+	if (io_handoff_sync_wanted(req, def, issue_flags)) {
+		io_queue_iowq_sync(req);
+		return 0;
+	}
 
 	/*
 	 * No point in a nonblocking attempt with a handoff armed. A force-async

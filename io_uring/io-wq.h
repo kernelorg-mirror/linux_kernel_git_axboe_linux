@@ -56,6 +56,16 @@ struct task_struct *io_wq_handoff_claim(struct io_wq *wq, bool bound,
 					struct task_struct *src);
 
 void io_wq_handoff_commit(struct task_struct *dst);
+
+/* outcome of io_wq_sync_issue() */
+enum {
+	IO_WQ_SYNC_NONE = 0,	/* no idle worker, the caller punts */
+	IO_WQ_SYNC_RUNNING,
+	IO_WQ_SYNC_DONE,	/* finished without blocking */
+	IO_WQ_SYNC_BLOCKED,	/* the worker blocked, it finishes async */
+	IO_WQ_SYNC_INTERRUPTED,	/* the caller got a signal, ditto */
+};
+int io_wq_sync_issue(struct io_wq *wq, struct io_wq_work *work, bool bound);
 io_wq_handoff_fn *io_wq_handoff_worker(void);
 bool io_wq_handoff_spare(struct io_wq *wq, bool bound, bool topup);
 void io_wq_handoff_finished(struct task_struct *tsk);

@@ -6,6 +6,11 @@
 #include "opdef.h"
 #include "tw.h"
 
+/* sysctl io_uring_handoff */
+#define IO_URING_HANDOFF_OFF		0
+#define IO_URING_HANDOFF_IDENTITY	1	/* blocked issue hands off its identity */
+#define IO_URING_HANDOFF_SYNC		2	/* an idle worker issues, we wait */
+
 #ifdef CONFIG_THREAD_HANDOFF
 extern int sysctl_io_uring_handoff;
 
@@ -59,6 +64,18 @@ static inline bool io_handoff_begin(struct io_kiocb *req,
 		return false;
 	return __io_handoff_begin(req);
 }
+
+/* if true, @req should go to an idle worker synchronously instead */
+static inline bool io_handoff_sync_wanted(struct io_kiocb *req,
+					  const struct io_issue_def *def,
+					  unsigned int issue_flags)
+{
+	if (sysctl_io_uring_handoff != IO_URING_HANDOFF_SYNC)
+		return false;
+	if (!(issue_flags & IO_URING_F_INLINE) || !def->blockable)
+		return false;
+	return io_handoff_possible(req);
+}
 #else
 static inline void io_handoff_enter(struct file *file, u32 to_submit,
 				    u32 min_complete, u32 flags,
@@ -72,6 +89,12 @@ static inline bool io_handoff_begin(struct io_kiocb *req,
 	return false;
 }
 static inline bool io_handoff_possible(struct io_kiocb *req)
+{
+	return false;
+}
+static inline bool io_handoff_sync_wanted(struct io_kiocb *req,
+					  const struct io_issue_def *def,
+					  unsigned int issue_flags)
 {
 	return false;
 }

@@ -21,6 +21,7 @@
 #include <uapi/linux/io_uring.h>
 #include <linux/kcov.h>
 #include <linux/thread_handoff.h>
+#include <trace/events/io_uring.h>
 
 #include "io-wq.h"
 #include "slist.h"
@@ -42,6 +43,7 @@ enum {
 	IO_WORKER_HANDOFF_PROMOTE,	/* claimed, set under ->workers_lock */
 	IO_WORKER_HANDOFF_DONE,		/* claimer took over the worker */
 	IO_WORKER_HANDOFF_FINISHED,	/* identity moved, demoted released */
+	IO_WORKER_HANDOFF_SYNC,		/* run ->sync_work for ->sync_waiter */
 };
 
 enum {
@@ -79,6 +81,11 @@ struct io_worker {
 	atomic_t handoff;
 	io_wq_handoff_fn *handoff_fn;
 	struct task_struct *handoff_task;
+
+	/* a submitter waiting for ->sync_work to finish or block */
+	struct task_struct *sync_waiter;
+	struct io_wq_work *sync_work;
+	atomic_t sync_state;
 
 	union {
 		struct rcu_head rcu;
@@ -731,6 +738,45 @@ static void io_worker_handle_work(struct io_wq_acct *acct,
 	} while (1);
 }
 
+/* release the waiting submitter, once, the first time we block or finish */
+static void io_wq_sync_release(struct io_worker *worker, int state)
+{
+	struct task_struct *waiter = worker->sync_waiter;
+
+	if (!waiter)
+		return;
+	worker->sync_waiter = NULL;
+	atomic_set_release(&worker->sync_state, state);
+	wake_up_process_sync(waiter);
+	put_task_struct(waiter);
+}
+
+/* run the work a submitter handed us directly, it waits for the outcome */
+static void io_wq_worker_sync_work(struct io_worker *worker)
+{
+	struct io_wq_work *work = worker->sync_work, *linked;
+	struct io_kiocb *req = container_of(work, struct io_kiocb, work);
+	bool last;
+
+	worker->sync_work = NULL;
+	atomic_set(&worker->handoff, IO_WORKER_HANDOFF_NONE);
+	__set_current_state(TASK_RUNNING);
+
+	io_assign_current_work(worker, work);
+	kcov_remote_start_common(req->ctx->kcov_handle);
+	io_wq_submit_work(work);
+	kcov_remote_stop();
+	io_assign_current_work(worker, NULL);
+
+	last = io_wq_put_work(work, &linked);
+	if (linked)
+		io_wq_enqueue(worker->wq, linked);
+	/* not before the link is pending again, see io_worker_handle_work() */
+	if (last)
+		io_wq_free_work(work);
+	io_wq_sync_release(worker, IO_WQ_SYNC_DONE);
+}
+
 /*
  * The worker has decided to exit, and has given up its ->nr_workers slot and
  * its place on the free list. io_wq_enqueue() may have picked it from that
@@ -862,8 +908,13 @@ static io_wq_handoff_fn *io_wq_worker_run(struct io_worker *worker)
 		set_bit(IO_WORKER_F_IDLE_SLEEP, &worker->flags);
 		atomic_inc(&acct->nr_iosleep);
 		ret = schedule_timeout(WORKER_IDLE_TIMEOUT);
-		if (unlikely(io_wq_worker_idle_done(acct, worker)))
+		if (unlikely(io_wq_worker_idle_done(acct, worker))) {
+			if (atomic_read(&worker->handoff) == IO_WORKER_HANDOFF_SYNC) {
+				io_wq_worker_sync_work(worker);
+				continue;
+			}
 			return io_wq_worker_promoted(worker);
+		}
 		if (signal_pending(current)) {
 			struct ksignal ksig;
 
@@ -985,6 +1036,73 @@ struct task_struct *io_wq_handoff_claim(struct io_wq *wq, bool bound,
 	return NULL;
 }
 
+/* claim an idle sleeper to run @work, see io_wq_worker_idle_done() */
+static struct io_worker *io_wq_acct_sync_claim(struct io_wq *wq,
+					       struct io_wq_acct *acct,
+					       struct io_wq_work *work)
+{
+	struct io_worker *worker, *found = NULL;
+	struct hlist_nulls_node *n;
+
+	raw_spin_lock(&acct->workers_lock);
+	if (test_bit(IO_WQ_BIT_EXIT, &wq->state))
+		goto out_unlock;
+	hlist_nulls_for_each_entry(worker, n, &acct->free_list, nulls_node) {
+		if (!test_bit(IO_WORKER_F_IDLE_SLEEP, &worker->flags))
+			continue;
+		/* dropped once we've seen the outcome */
+		if (!io_worker_get(worker))
+			continue;
+		clear_bit(IO_WORKER_F_FREE, &worker->flags);
+		hlist_nulls_del_init_rcu(&worker->nulls_node);
+		worker->sync_work = work;
+		worker->sync_waiter = get_task_struct(current);
+		worker->handoff_task = worker->task;
+		atomic_set(&worker->sync_state, IO_WQ_SYNC_RUNNING);
+		atomic_set_release(&worker->handoff, IO_WORKER_HANDOFF_SYNC);
+		found = worker;
+		break;
+	}
+out_unlock:
+	raw_spin_unlock(&acct->workers_lock);
+	return found;
+}
+
+/*
+ * Have an idle worker run @work right away and wait until it's done or has
+ * blocked. Returns IO_WQ_SYNC_NONE if no worker was idle, nothing happened.
+ */
+int io_wq_sync_issue(struct io_wq *wq, struct io_wq_work *work, bool bound)
+{
+	struct io_kiocb *req = container_of(work, struct io_kiocb, work);
+	struct io_worker *worker;
+	int state;
+
+	worker = io_wq_acct_sync_claim(wq, io_get_acct(wq, bound), work);
+	if (!worker)
+		worker = io_wq_acct_sync_claim(wq, io_get_acct(wq, !bound), work);
+	if (!worker)
+		return IO_WQ_SYNC_NONE;
+
+	trace_io_uring_handoff(req, worker->task);
+	wake_up_process_sync(worker->task);
+	for (;;) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		state = atomic_read_acquire(&worker->sync_state);
+		if (state != IO_WQ_SYNC_RUNNING)
+			break;
+		/* task_work notifications don't count, only real signals */
+		if (task_sigpending(current)) {
+			state = IO_WQ_SYNC_INTERRUPTED;
+			break;
+		}
+		schedule();
+	}
+	__set_current_state(TASK_RUNNING);
+	io_worker_release(worker);
+	return state;
+}
+
 /* we take over the worker @dst was, @dst goes on to run the handoff fn */
 void io_wq_handoff_commit(struct task_struct *dst)
 {
@@ -1102,6 +1220,9 @@ void io_wq_worker_sleeping(struct task_struct *tsk)
 		return;
 	if (!test_bit(IO_WORKER_F_UP, &worker->flags))
 		return;
+	/* blocking is what a sync submitter waits for, once we've started */
+	if (!test_bit(IO_WORKER_F_IDLE_SLEEP, &worker->flags))
+		io_wq_sync_release(worker, IO_WQ_SYNC_BLOCKED);
 	if (!test_bit(IO_WORKER_F_RUNNING, &worker->flags))
 		return;
 

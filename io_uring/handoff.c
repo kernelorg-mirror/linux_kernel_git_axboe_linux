@@ -71,7 +71,8 @@ bool io_handoff_possible(struct io_kiocb *req)
 	if (!tctx->io_wq)
 		return false;
 	/* an intermediate task's own user state doesn't matter, it stays */
-	if (!tctx->handoff.src && !thread_handoff_allowed(current)) {
+	if (sysctl_io_uring_handoff == IO_URING_HANDOFF_IDENTITY &&
+	    !tctx->handoff.src && !thread_handoff_allowed(current)) {
 		trace_io_uring_handoff_fail(req, "task");
 		return false;
 	}
@@ -132,6 +133,8 @@ bool __io_handoff_begin(struct io_kiocb *req)
 {
 	struct io_handoff *ho = &current->io_uring->handoff;
 
+	if (sysctl_io_uring_handoff != IO_URING_HANDOFF_IDENTITY)
+		return false;
 	if (!io_handoff_possible(req))
 		return false;
 	/* would interrupt the issue right away, and can't be handled here */
