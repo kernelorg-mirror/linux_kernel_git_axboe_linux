@@ -139,6 +139,18 @@ unsigned long blk_mq_get_tags(struct blk_mq_alloc_data *data, int nr_tags,
 		return 0;
 	ret = __sbitmap_queue_get_batch(bt, nr_tags, offset);
 	*offset += tags->nr_reserved_tags;
+
+	/*
+	 * Give up this allocation if the hctx is inactive, like blk_mq_get_tag()
+	 * does. The caller falls back to it and will retry on an active hctx.
+	 */
+	if (ret && unlikely(test_bit(BLK_MQ_S_INACTIVE, &data->hctx->state))) {
+		unsigned int i;
+
+		for_each_set_bit(i, &ret, BITS_PER_LONG)
+			blk_mq_put_tag(tags, data->ctx, *offset + i);
+		return 0;
+	}
 	return ret;
 }
 
