@@ -365,9 +365,15 @@ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
 	 * Users don't rely on the iterator being in any particular
 	 * state for async I/O returning -EIOCBQUEUED, hence we can
 	 * avoid expensive iov_iter_advance(). Bypass
-	 * bio_iov_iter_get_pages() and set the bvec directly.
+	 * bio_iov_iter_get_pages() and set the bvec directly, which leaves
+	 * its alignment check to us.
 	 */
-	if (!bio_iov_iter_set(bio, iter)) {
+	if (bio_iov_iter_set(bio, iter)) {
+		if (!bio_iov_bvec_aligned(bio, bdev_dma_alignment(bdev))) {
+			ret = -EINVAL;
+			goto out_bio_put;
+		}
+	} else {
 		ret = blkdev_iov_iter_get_pages(bio, iter, bdev);
 		if (unlikely(ret))
 			goto out_bio_put;
