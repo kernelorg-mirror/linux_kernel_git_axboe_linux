@@ -3205,8 +3205,9 @@ new_request:
 
 	ret = blk_crypto_rq_get_keyslot(rq);
 	if (ret != BLK_STS_OK) {
-		bio_endio_status(bio, ret);
-		blk_mq_free_request(rq);
+		if (bio_zone_write_plugging(bio))
+			blk_zone_write_plug_init_request(rq);
+		blk_mq_end_request(rq, ret);
 		return;
 	}
 
