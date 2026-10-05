@@ -1871,9 +1871,20 @@ void blk_zone_write_plug_bio_endio(struct bio *bio)
 	 * needing a write pointer update.
 	 */
 	if (bio->bi_status != BLK_STS_OK) {
+		unsigned int plugged = 0;
+
 		spin_lock_irqsave(&zwplug->lock, flags);
+		/*
+		 * The abort unplugs the zone. But the flag still belongs to a
+		 * write in flight (this one, until its request is finished) or
+		 * to the BIO work, and they clear it when they are done. The
+		 * zone write plugs worker does not rely on the flag to issue
+		 * one write at a time and forgets the plug with the abort.
+		 */
+		if (!blk_queue_zoned_qd1_writes(disk->queue))
+			plugged = zwplug->flags & BLK_ZONE_WPLUG_PLUGGED;
 		disk_zone_wplug_abort(zwplug);
-		zwplug->flags |= BLK_ZONE_WPLUG_NEED_WP_UPDATE;
+		zwplug->flags |= BLK_ZONE_WPLUG_NEED_WP_UPDATE | plugged;
 		spin_unlock_irqrestore(&zwplug->lock, flags);
 	}
 
