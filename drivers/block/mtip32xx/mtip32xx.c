@@ -3887,6 +3887,17 @@ done:
 	return rv;
 }
 
+static void mtip_stop_service_thread(struct driver_data *dd)
+{
+	if (!dd->mtip_svc_handler)
+		return;
+
+	set_bit(MTIP_PF_SVC_THD_STOP_BIT, &dd->port->flags);
+	wake_up_interruptible(&dd->port->svc_wait);
+	kthread_stop(dd->mtip_svc_handler);
+	dd->mtip_svc_handler = NULL;
+}
+
 /*
  * Called for each probed device when the device is removed or the
  * driver is unloaded.
@@ -3917,16 +3928,23 @@ static void mtip_pci_remove(struct pci_dev *pdev)
 	set_bit(MTIP_DDF_REMOVE_PENDING_BIT, &dd->dd_flag);
 	mutex_lock(&dd->ioctl_mutex);
 
+	/*
+	 * Nobody will complete the commands a removed device has been given,
+	 * and del_gendisk() waits for them.
+	 */
+	if (dd->sr) {
+		mtip_stop_service_thread(dd);
+		blk_mq_quiesce_queue(dd->queue);
+		blk_mq_tagset_busy_iter(&dd->tags, mtip_abort_cmd, dd);
+		blk_mq_unquiesce_queue(dd->queue);
+	}
+
 	if (test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag))
 		del_gendisk(dd->disk);
 
 	mtip_hw_debugfs_exit(dd);
 
-	if (dd->mtip_svc_handler) {
-		set_bit(MTIP_PF_SVC_THD_STOP_BIT, &dd->port->flags);
-		wake_up_interruptible(&dd->port->svc_wait);
-		kthread_stop(dd->mtip_svc_handler);
-	}
+	mtip_stop_service_thread(dd);
 
 	if (!dd->sr) {
 		/*
