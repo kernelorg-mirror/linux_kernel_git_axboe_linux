@@ -3394,6 +3394,11 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
 
 	body = ctx.body;
 	disk = ctx.bdev->bd_disk;
+	/* It may have gone while the mutex was not held */
+	if (!disk_live(disk)) {
+		ret = -ENODEV;
+		goto close_bdev;
+	}
 	if (!queue_is_mq(disk->queue)) {
 		ret = -EOPNOTSUPP;
 		goto close_bdev;
