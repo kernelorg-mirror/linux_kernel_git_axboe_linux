@@ -13,6 +13,10 @@ static bool __blk_map_iter_next(struct blk_map_iter *iter)
 	if (!iter->bio || !iter->bio->bi_next)
 		return false;
 
+	/* All the metadata of a passthrough request is in its first bio */
+	if (iter->is_integrity && !bio_integrity(iter->bio->bi_next))
+		return false;
+
 	iter->bio = iter->bio->bi_next;
 	if (iter->is_integrity) {
 		iter->iter = bio_integrity(iter->bio)->bip_iter;
@@ -347,6 +351,10 @@ bool blk_rq_integrity_dma_map_iter_start(struct request *req,
 	unsigned len = bio_integrity_bytes(&req->q->limits.integrity,
 					   blk_rq_sectors(req));
 	struct bio *bio = req->bio;
+
+	/* User space decides how much metadata a passthrough request has */
+	if (blk_rq_is_passthrough(req))
+		len = bio_integrity(bio)->bip_iter.bi_size;
 
 	iter->iter = (struct blk_map_iter) {
 		.bio = bio,
