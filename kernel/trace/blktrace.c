@@ -468,18 +468,17 @@ static void __blk_add_trace(struct blk_trace *bt, sector_t sector, int bytes,
 
 static void blk_trace_free(struct request_queue *q, struct blk_trace *bt)
 {
-	relay_close(bt->rchan);
-
 	/*
 	 * If 'bt->dir' is not set, then both 'dropped' and 'msg' are created
-	 * under 'q->debugfs_dir', thus lookup and remove them.
+	 * under 'q->debugfs_dir', thus lookup and remove them. They use the
+	 * relay channel: wait for their users before it goes away.
 	 */
-	if (!bt->dir) {
-		debugfs_lookup_and_remove("dropped", q->debugfs_dir);
-		debugfs_lookup_and_remove("msg", q->debugfs_dir);
-	} else {
-		debugfs_remove(bt->dir);
-	}
+	debugfs_lookup_and_remove("dropped", bt->dir ?: q->debugfs_dir);
+	debugfs_lookup_and_remove("msg", bt->dir ?: q->debugfs_dir);
+
+	relay_close(bt->rchan);
+	debugfs_remove(bt->dir);
+
 	free_percpu(bt->sequence);
 	free_percpu(bt->msg_data);
 	kfree(bt);
