@@ -1408,7 +1408,7 @@ void io_send_zc_cleanup(struct io_kiocb *req)
 
 #define IO_ZC_FLAGS_COMMON (IORING_RECVSEND_POLL_FIRST | IORING_RECVSEND_FIXED_BUF)
 #define IO_ZC_FLAGS_VALID  (IO_ZC_FLAGS_COMMON | IORING_SEND_ZC_REPORT_USAGE | \
-				IORING_SEND_VECTORIZED)
+				IORING_SEND_VECTORIZED | IORING_SEND_QUIET)
 
 int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
@@ -1449,6 +1449,11 @@ int io_send_zc_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 			nd->zc_report = true;
 			nd->zc_used = false;
 			nd->zc_copied = false;
+		}
+		/* both the send and its notification CQE are quiet */
+		if (zc->flags & IORING_SEND_QUIET) {
+			req->flags |= REQ_F_CQE_QUIET;
+			notif->flags |= REQ_F_CQE_QUIET;
 		}
 	}
 
@@ -1615,6 +1620,7 @@ int io_sendmsg_zc(struct io_kiocb *req, unsigned int issue_flags)
 			ret = -EINTR;
 		req_set_fail(req);
 	}
+	io_send_check_quiet(req, kmsg);
 
 	if (ret >= 0)
 		ret += sr->done_io;

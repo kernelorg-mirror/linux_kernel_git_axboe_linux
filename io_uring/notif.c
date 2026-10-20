@@ -63,7 +63,7 @@ void io_tx_ubuf_complete(struct sk_buff *skb, struct ubuf_info *uarg,
 		return;
 	}
 
-	tw_flags = nd->next ? 0 : IOU_F_TWQ_LAZY_WAKE;
+	tw_flags = nd->next ? 0 : IOU_F_TWQ_LAZY_WAKE | IOU_F_TWQ_QUIET;
 	notif->io_task_work.func = io_notif_tw_complete;
 	__io_req_task_work_add(notif, tw_flags);
 }
