@@ -297,7 +297,8 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 		 * now rather than let the caller do another wait loop.
 		 */
 		if (io_local_work_pending(ctx))
-			io_run_local_work(ctx, nr_wait, nr_wait);
+			io_run_local_work(ctx, nr_wait,
+					  max(nr_wait, IO_LOCAL_TW_DEFAULT_MAX));
 		io_run_task_work();
 
 		/*

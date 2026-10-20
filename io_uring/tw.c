@@ -193,6 +193,12 @@ void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
 	 */
 	if (req->flags & IO_REQ_LINK_FLAGS)
 		flags &= ~IOU_F_TWQ_LAZY_WAKE;
+	/* only a final and successful completion is quiet */
+	if ((flags & IOU_F_TWQ_QUIET) &&
+	    ((req->flags & (REQ_F_CQE_QUIET | IO_REQ_LINK_FLAGS |
+			    REQ_F_IO_DRAIN | REQ_F_REISSUE)) != REQ_F_CQE_QUIET ||
+	     req->cqe.res < 0))
+		flags &= ~IOU_F_TWQ_QUIET;
 
 	/*
 	 * The xchg() in mpscq_push() implies a full barrier, which pairs with
@@ -209,6 +215,10 @@ void io_req_local_work_add(struct io_kiocb *req, unsigned flags)
 		if (data_race(ctx->int_flags) & IO_RING_F_POLL_ACTIVATED)
 			io_local_work_wake_poll(ctx, flags);
 	}
+
+	/* doesn't count towards waking the waiter */
+	if (flags & IOU_F_TWQ_QUIET)
+		return;
 
 	/*
 	 * No one is waiting (IO_CQ_WAKE_INIT), or this cycle's wake up has

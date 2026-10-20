@@ -993,7 +993,7 @@ static void io_req_complete_post(struct io_kiocb *req, unsigned issue_flags)
 	    (req->flags & (REQ_F_REISSUE | REQ_F_IO_DRAIN))) {
 defer_complete:
 		req->io_task_work.func = io_req_task_complete;
-		io_req_task_work_add(req);
+		__io_req_task_work_add(req, IOU_F_TWQ_QUIET);
 		return;
 	}
 

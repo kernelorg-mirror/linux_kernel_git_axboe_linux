@@ -29,6 +29,12 @@ enum {
 	 * epoll, so the eventfd signal must be deferred.
 	 */
 	IOU_F_TWQ_IN_WAKE			= 2,
+
+	/*
+	 * Posts the CQE of a REQ_F_CQE_QUIET request. Never wakes a
+	 * DEFER_TASKRUN waiter, the CQE is posted when it next runs task_work.
+	 */
+	IOU_F_TWQ_QUIET				= 4,
 };
 
 enum io_uring_cmd_flags {
