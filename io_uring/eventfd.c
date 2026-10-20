@@ -78,6 +78,7 @@ void io_eventfd_signal(struct io_ring_ctx *ctx, bool cqe_event, bool defer)
 	bool skip = false;
 	struct io_ev_fd *ev_fd;
 	struct io_rings *rings;
+	unsigned tail;
 
 	guard(rcu)();
 
@@ -108,8 +109,9 @@ void io_eventfd_signal(struct io_ring_ctx *ctx, bool cqe_event, bool defer)
 		 * the CQ ring.
 		 */
 		spin_lock(&ctx->completion_lock);
-		skip = ctx->cached_cq_tail == ev_fd->last_cq_tail;
-		ev_fd->last_cq_tail = ctx->cached_cq_tail;
+		tail = ctx->cached_cq_tail - ctx->cq_quiet;
+		skip = tail == ev_fd->last_cq_tail;
+		ev_fd->last_cq_tail = tail;
 		spin_unlock(&ctx->completion_lock);
 	}
 
@@ -145,7 +147,7 @@ int io_eventfd_register(struct io_ring_ctx *ctx, void __user *arg,
 	}
 
 	spin_lock(&ctx->completion_lock);
-	ev_fd->last_cq_tail = ctx->cached_cq_tail;
+	ev_fd->last_cq_tail = ctx->cached_cq_tail - ctx->cq_quiet;
 	spin_unlock(&ctx->completion_lock);
 
 	ev_fd->eventfd_async = eventfd_async;

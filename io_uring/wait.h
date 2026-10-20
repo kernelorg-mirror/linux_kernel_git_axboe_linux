@@ -36,6 +36,8 @@ struct ext_arg {
 	ktime_t min_time;
 	bool ts_set;
 	bool iowait;
+	/* ->cq_quiet at syscall entry, quiet CQEs posted since don't count */
+	unsigned cq_quiet;
 };
 
 int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,

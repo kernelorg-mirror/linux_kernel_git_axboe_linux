@@ -92,10 +92,11 @@ static enum hrtimer_restart io_cqring_min_timer_wakeup(struct hrtimer *timer)
 	scoped_guard(rcu) {
 		struct io_rings *rings = io_get_rings(ctx);
 
-		if (iowq->cq_min_tail != READ_ONCE(rings->cq.tail))
+		if (iowq->cq_min_tail != io_cq_wait_tail(iowq, rings))
 			goto out_wake;
 		/* if we have any events and min timeout expired, we're done */
-		if (io_cqring_events(ctx))
+		if ((int) (io_cq_wait_tail(iowq, rings) -
+			   READ_ONCE(rings->cq.head)) > 0)
 			goto out_wake;
 	}
 	/*
@@ -223,10 +224,17 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 
 	if (unlikely(test_bit(IO_CHECK_CQ_OVERFLOW_BIT, &ctx->check_cq)))
 		io_cqring_do_overflow_flush(ctx);
+	/* a racing quiet post can briefly look like fewer events than 0 */
+	if (!min_events)
+		return 0;
+
+	iowq.ctx = ctx;
+	iowq.cq_quiet = ext_arg->cq_quiet;
 
 	rcu_read_lock();
 	rings = io_get_rings(ctx);
-	if (__io_cqring_events_user(ctx) >= min_events) {
+	iowq.cq_min_tail = io_cq_wait_tail(&iowq, rings);
+	if ((int) (iowq.cq_min_tail - READ_ONCE(rings->cq.head)) >= min_events) {
 		rcu_read_unlock();
 		return 0;
 	}
@@ -234,10 +242,8 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 	init_waitqueue_func_entry(&iowq.wq, io_wake_function);
 	iowq.wq.private = current;
 	INIT_LIST_HEAD(&iowq.wq.entry);
-	iowq.ctx = ctx;
 	iowq.cq_tail = READ_ONCE(rings->cq.head) + min_events;
-	iowq.cq_min_tail = READ_ONCE(rings->cq.tail);
-	nr_wait = (int) iowq.cq_tail - READ_ONCE(rings->cq.tail);
+	nr_wait = (int) iowq.cq_tail - iowq.cq_min_tail;
 	rcu_read_unlock();
 	rings = NULL;
 	iowq.nr_timeouts = atomic_read(&ctx->cq_timeouts);
@@ -336,7 +342,7 @@ int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
 		if (!iowq.hit_timeout)
 			scoped_guard(rcu)
 				nr_wait = (int) iowq.cq_tail -
-						READ_ONCE(io_get_rings(ctx)->cq.tail);
+					io_cq_wait_tail(&iowq, io_get_rings(ctx));
 		else
 			nr_wait = 1;
 	} while (1);

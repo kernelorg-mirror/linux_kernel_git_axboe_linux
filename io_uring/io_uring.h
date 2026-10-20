@@ -131,6 +131,7 @@ struct io_wait_queue {
 	struct io_ring_ctx *ctx;
 	unsigned cq_tail;
 	unsigned cq_min_tail;
+	unsigned cq_quiet;
 	unsigned nr_timeouts;
 	int hit_timeout;
 	ktime_t min_timeout;
@@ -150,6 +151,16 @@ static inline struct io_rings *io_get_rings(struct io_ring_ctx *ctx)
 			lockdep_is_held(&ctx->completion_lock));
 }
 
+/* CQ tail as seen by a waiter, minus quiet CQEs posted since it started */
+static inline unsigned io_cq_wait_tail(struct io_wait_queue *iowq,
+				       struct io_rings *rings)
+{
+	/* pairs with io_commit_cqring(), quiet CQEs are counted before */
+	unsigned tail = smp_load_acquire(&rings->cq.tail);
+
+	return tail - (READ_ONCE(iowq->ctx->cq_quiet) - iowq->cq_quiet);
+}
+
 static inline bool io_should_wake(struct io_wait_queue *iowq)
 {
 	struct io_ring_ctx *ctx = iowq->ctx;
@@ -164,7 +175,7 @@ static inline bool io_should_wake(struct io_wait_queue *iowq)
 	 * started waiting. For timeouts, we always want to return to userspace,
 	 * regardless of event count.
 	 */
-	dist = READ_ONCE(rings->cq.tail) - (int) iowq->cq_tail;
+	dist = io_cq_wait_tail(iowq, rings) - (int) iowq->cq_tail;
 	return dist >= 0 || atomic_read(&ctx->cq_timeouts) != iowq->nr_timeouts;
 }
 
@@ -299,6 +310,7 @@ static __always_inline bool io_fill_cqe_req(struct io_ring_ctx *ctx,
 					    struct io_kiocb *req)
 {
 	bool is_cqe32 = req->cqe.flags & IORING_CQE_F_32;
+	unsigned int tail = ctx->cached_cq_tail;
 	struct io_uring_cqe *cqe;
 
 	/*
@@ -307,6 +319,11 @@ static __always_inline bool io_fill_cqe_req(struct io_ring_ctx *ctx,
 	 */
 	if (unlikely(!io_get_cqe(ctx, &cqe, is_cqe32)))
 		return false;
+
+	/* count all CQ slots used, including any padding */
+	if (unlikely(req->flags & REQ_F_CQE_QUIET) && req->cqe.res >= 0)
+		WRITE_ONCE(ctx->cq_quiet,
+			   ctx->cq_quiet + ctx->cached_cq_tail - tail);
 
 	memcpy(cqe, &req->cqe, sizeof(*cqe));
 	if (ctx->flags & IORING_SETUP_CQE32 || is_cqe32) {

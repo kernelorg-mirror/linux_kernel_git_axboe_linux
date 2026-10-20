@@ -2821,6 +2821,8 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		size_t, argsz)
 {
 	struct io_ring_ctx *ctx;
+	bool submitted = false;
+	unsigned cq_quiet;
 	struct file *file;
 	long ret;
 
@@ -2867,6 +2869,12 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 			goto out;
 
 		mutex_lock(&ctx->uring_lock);
+		/* a wait doesn't count quiet CQEs posted by this submission */
+		if ((flags & IORING_ENTER_GETEVENTS) &&
+		    !(ctx->int_flags & IO_RING_F_SYSCALL_IOPOLL)) {
+			cq_quiet = READ_ONCE(ctx->cq_quiet);
+			submitted = true;
+		}
 		ret = io_submit_sqes(ctx, to_submit);
 		if (ret != to_submit) {
 			mutex_unlock(&ctx->uring_lock);
@@ -2903,6 +2911,10 @@ iopoll_locked:
 			mutex_unlock(&ctx->uring_lock);
 		} else {
 			struct ext_arg ext_arg = { .argsz = argsz };
+
+			if (!submitted)
+				cq_quiet = READ_ONCE(ctx->cq_quiet);
+			ext_arg.cq_quiet = cq_quiet;
 
 			ret2 = io_get_ext_arg(ctx, flags, argp, &ext_arg);
 			if (likely(!ret2))
