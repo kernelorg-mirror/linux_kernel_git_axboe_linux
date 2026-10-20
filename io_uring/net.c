@@ -389,7 +389,8 @@ static int io_sendmsg_setup(struct io_kiocb *req, const struct io_uring_sqe *sqe
 }
 
 #define SENDMSG_FLAGS (IORING_RECVSEND_POLL_FIRST | IORING_RECVSEND_BUNDLE | \
-			IORING_SEND_VECTORIZED | IORING_RECVSEND_FIXED_BUF)
+			IORING_SEND_VECTORIZED | IORING_RECVSEND_FIXED_BUF | \
+			IORING_SEND_QUIET)
 
 int io_sendmsg_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
@@ -421,6 +422,11 @@ int io_sendmsg_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 			return -EINVAL;
 		sr->msg_flags |= MSG_WAITALL;
 		req->flags |= REQ_F_MULTISHOT;
+	}
+	if (sr->flags & IORING_SEND_QUIET) {
+		if (sr->flags & IORING_RECVSEND_BUNDLE)
+			return -EINVAL;
+		req->flags |= REQ_F_CQE_QUIET;
 	}
 
 	if (io_is_compat(req->ctx))
@@ -545,6 +551,14 @@ finish:
 	return true;
 }
 
+/* a short send isn't quiet */
+static void io_send_check_quiet(struct io_kiocb *req,
+				struct io_async_msghdr *kmsg)
+{
+	if (unlikely(req->flags & REQ_F_CQE_QUIET) && msg_data_left(&kmsg->msg))
+		req->flags &= ~REQ_F_CQE_QUIET;
+}
+
 int io_sendmsg(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_sr_msg *sr = io_kiocb_to_cmd(req, struct io_sr_msg);
@@ -585,6 +599,7 @@ int io_sendmsg(struct io_kiocb *req, unsigned int issue_flags)
 			ret = -EINTR;
 		req_set_fail(req);
 	}
+	io_send_check_quiet(req, kmsg);
 	io_req_msg_cleanup(req, issue_flags);
 	if (ret >= 0)
 		ret += sr->done_io;
@@ -706,6 +721,7 @@ retry_bundle:
 			ret = -EINTR;
 		req_set_fail(req);
 	}
+	io_send_check_quiet(req, kmsg);
 	if (ret >= 0)
 		ret += sr->done_io;
 	else if (sr->done_io)
@@ -1624,6 +1640,8 @@ void io_sendrecv_fail(struct io_kiocb *req)
 
 	if (sr->done_io)
 		req->cqe.res = sr->done_io;
+	/* a failed partial send has res >= 0, and isn't quiet */
+	req->flags &= ~REQ_F_CQE_QUIET;
 
 	if ((req->flags & REQ_F_NEED_CLEANUP) &&
 	    (req->opcode == IORING_OP_SEND_ZC || req->opcode == IORING_OP_SENDMSG_ZC))
