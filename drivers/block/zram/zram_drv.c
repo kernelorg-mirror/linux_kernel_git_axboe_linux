@@ -2795,11 +2795,33 @@ static void zram_bio_write(struct zram *zram, struct bio *bio)
 }
 
 /*
+ * bio_check_eod() counts whole sectors: it does not look at a bio that is
+ * shorter than a sector, nor at a tail that is shorter than one. zram takes
+ * such a piece to the slot of its sector, so round the size up. An empty bio
+ * has to start inside the device as well: the loops for reads and writes run
+ * once before their test.
+ */
+static bool zram_bio_in_range(struct zram *zram, struct bio *bio)
+{
+	sector_t nr_sectors = get_capacity(zram->disk);
+	sector_t start = bio->bi_iter.bi_sector;
+	sector_t len = ((sector_t)bio->bi_iter.bi_size + SECTOR_SIZE - 1) >>
+			SECTOR_SHIFT;
+
+	return start < nr_sectors && len <= nr_sectors - start;
+}
+
+/*
  * Handler function for all zram I/O requests.
  */
 static void zram_submit_bio(struct bio *bio)
 {
 	struct zram *zram = bio->bi_bdev->bd_disk->private_data;
+
+	if (unlikely(!zram_bio_in_range(zram, bio))) {
+		bio_io_error(bio);
+		return;
+	}
 
 	switch (bio_op(bio)) {
 	case REQ_OP_READ:
