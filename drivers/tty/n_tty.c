@@ -2372,7 +2372,13 @@ static ssize_t n_tty_write(struct tty_struct *tty, struct kiocb *iocb,
 
 	add_wait_queue(&tty->write_wait, &wait);
 	while (1) {
-		if (signal_pending(current)) {
+		/*
+		 * io_uring issues IOCB_NOWAIT writes while it has task work
+		 * queued for the task, and signal_pending() returns true for
+		 * that. An IOCB_NOWAIT write never sleeps here, so a pending
+		 * signal is no reason to fail it.
+		 */
+		if (!(iocb->ki_flags & IOCB_NOWAIT) && signal_pending(current)) {
 			retval = -ERESTARTSYS;
 			break;
 		}
