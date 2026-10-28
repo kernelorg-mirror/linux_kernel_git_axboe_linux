@@ -5208,10 +5208,18 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
 		blk_mq_freeze_queue_nomemsave(q);
 	queues_frozen = true;
 	if (new_tags) {
-		kfree(set->tags);
-		set->tags = new_tags;
+		struct blk_mq_tags **old_tags = set->tags;
+
+		/*
+		 * blk_mq_tagset_busy_iter() doesn't care about the freeze, it
+		 * reads the array under blk_mq_tags_srcu like the tags.
+		 */
+		smp_store_release(&set->tags, new_tags);
+		synchronize_srcu(&blk_mq_tags_srcu);
+		kfree(old_tags);
 	}
-	set->nr_hw_queues = nr_hw_queues;
+	/* Whoever sees the new number has to see the new array as well */
+	smp_store_release(&set->nr_hw_queues, nr_hw_queues);
 
 fallback:
 	blk_mq_update_queue_map(set);

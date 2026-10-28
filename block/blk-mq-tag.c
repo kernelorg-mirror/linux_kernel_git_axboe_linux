@@ -460,16 +460,23 @@ void blk_mq_tagset_busy_iter(struct blk_mq_tag_set *tagset,
 		busy_tag_iter_fn *fn, void *priv)
 {
 	unsigned int flags = tagset->flags;
+	struct blk_mq_tags **tags;
 	int i, nr_tags, srcu_idx;
 
 	srcu_idx = srcu_read_lock(&blk_mq_tags_srcu);
 
-	nr_tags = blk_mq_is_shared_tags(flags) ? 1 : tagset->nr_hw_queues;
+	/* Pairs with the release in __blk_mq_update_nr_hw_queues() */
+	nr_tags = smp_load_acquire(&tagset->nr_hw_queues);
+	if (blk_mq_is_shared_tags(flags))
+		nr_tags = 1;
 
-	for (i = 0; i < nr_tags; i++) {
-		if (tagset->tags && tagset->tags[i])
-			__blk_mq_all_tag_iter(tagset->tags[i], fn, priv,
-					      BT_TAG_ITER_STARTED);
+	/* An update may replace the array, it's freed after a grace period */
+	tags = READ_ONCE(tagset->tags);
+	for (i = 0; tags && i < nr_tags; i++) {
+		struct blk_mq_tags *t = READ_ONCE(tags[i]);
+
+		if (t)
+			__blk_mq_all_tag_iter(t, fn, priv, BT_TAG_ITER_STARTED);
 	}
 	srcu_read_unlock(&blk_mq_tags_srcu, srcu_idx);
 }
