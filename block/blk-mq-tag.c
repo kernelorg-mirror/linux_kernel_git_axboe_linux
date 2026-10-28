@@ -133,20 +133,25 @@ unsigned long blk_mq_get_tags(struct blk_mq_alloc_data *data, int nr_tags,
 	struct blk_mq_tags *tags = blk_mq_tags_from_data(data);
 	struct sbitmap_queue *bt = &tags->bitmap_tags;
 	unsigned long ret;
+	unsigned int i;
 
 	if (data->shallow_depth ||data->flags & BLK_MQ_REQ_RESERVED ||
 	    data->hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED)
 		return 0;
 	ret = __sbitmap_queue_get_batch(bt, nr_tags, offset);
+	if (!ret)
+		return 0;
 	*offset += tags->nr_reserved_tags;
+
+	/* See blk_mq_get_tag() */
+	for_each_set_bit(i, &ret, BITS_PER_LONG)
+		tags->static_rqs[*offset + i]->mq_hctx = data->hctx;
 
 	/*
 	 * Give up this allocation if the hctx is inactive, like blk_mq_get_tag()
 	 * does. The caller falls back to it and will retry on an active hctx.
 	 */
-	if (ret && unlikely(test_bit(BLK_MQ_S_INACTIVE, &data->hctx->state))) {
-		unsigned int i;
-
+	if (unlikely(test_bit(BLK_MQ_S_INACTIVE, &data->hctx->state))) {
 		for_each_set_bit(i, &ret, BITS_PER_LONG)
 			blk_mq_put_tag(tags, data->ctx, *offset + i);
 		return 0;
@@ -239,6 +244,15 @@ unsigned int blk_mq_get_tag(struct blk_mq_alloc_data *data)
 	sbitmap_finish_wait(bt, ws, &wait);
 
 found_tag:
+	/*
+	 * blk_mq_hctx_notify_offline() tells the requests of its hctx by
+	 * ->mq_hctx, and looks for them after setting the flag tested below.
+	 * Point the request at us before the test, as blk_mq_rq_ctx_init()
+	 * will again: what an earlier user of a shared tag left there would
+	 * hide it.
+	 */
+	tags->static_rqs[tag + tag_offset]->mq_hctx = data->hctx;
+
 	/*
 	 * Give up this allocation if the hctx is inactive.  The caller will
 	 * retry on an active hctx.
