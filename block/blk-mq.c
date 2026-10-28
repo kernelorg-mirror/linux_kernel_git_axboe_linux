@@ -3739,48 +3739,95 @@ static bool blk_mq_hctx_has_online_cpu(struct blk_mq_hw_ctx *hctx,
 	return false;
 }
 
+/*
+ * The hctxs that lose their last CPU to the offline in progress. Hotplug
+ * operations are serialized, and only the hotplug thread touches the list.
+ */
+static LIST_HEAD(blk_mq_inactive_hctxs);
+
 static int blk_mq_hctx_notify_offline(unsigned int cpu, struct hlist_node *node)
 {
 	struct blk_mq_hw_ctx *hctx = hlist_entry_safe(node,
 			struct blk_mq_hw_ctx, cpuhp_online);
-	int ret = 0;
 
 	if (!hctx->nr_ctx || blk_mq_hctx_has_online_cpu(hctx, cpu))
 		return 0;
 
 	/*
-	 * Prevent new request from being allocated on the current hctx.
-	 *
-	 * The smp_mb__after_atomic() Pairs with the implied barrier in
-	 * test_and_set_bit_lock in sbitmap_get().  Ensures the inactive flag is
-	 * seen once we return from the tag allocator.
+	 * Prevent new requests from being allocated on the hctx. The barrier
+	 * that orders this against the allocations, and the wait for the ones
+	 * in flight, come once for all hctxs in blk_mq_drain_inactive_hctxs().
 	 */
 	set_bit(BLK_MQ_S_INACTIVE, &hctx->state);
-	smp_mb__after_atomic();
+	list_add_tail(&hctx->inactive_entry, &blk_mq_inactive_hctxs);
+	return 0;
+}
+
+static int blk_mq_hctx_wait_inactive(struct blk_mq_hw_ctx *hctx)
+{
+	int ret = 0;
 
 	/*
 	 * Try to grab a reference to the queue and wait for any outstanding
 	 * requests.  If we could not grab a reference the queue has been
 	 * frozen and there are no requests.
 	 */
-	if (percpu_ref_tryget(&hctx->queue->q_usage_counter)) {
-		while (blk_mq_hctx_has_requests(hctx)) {
-			/*
-			 * The wakeup capable IRQ handler of block device is
-			 * not called during suspend. Skip the loop by checking
-			 * pm_wakeup_pending to prevent the deadlock and improve
-			 * suspend latency.
-			 */
-			if (pm_wakeup_pending()) {
-				clear_bit(BLK_MQ_S_INACTIVE, &hctx->state);
-				ret = -EBUSY;
-				break;
-			}
-			msleep(5);
-		}
-		percpu_ref_put(&hctx->queue->q_usage_counter);
-	}
+	if (!percpu_ref_tryget(&hctx->queue->q_usage_counter))
+		return 0;
 
+	while (blk_mq_hctx_has_requests(hctx)) {
+		/*
+		 * The wakeup capable IRQ handler of block device is not called
+		 * during suspend. Skip the loop by checking pm_wakeup_pending
+		 * to prevent the deadlock and improve suspend latency.
+		 */
+		if (pm_wakeup_pending()) {
+			ret = -EBUSY;
+			break;
+		}
+		msleep(5);
+	}
+	percpu_ref_put(&hctx->queue->q_usage_counter);
+	return ret;
+}
+
+static void blk_mq_ipi_mb(void *info)
+{
+	smp_mb();
+}
+
+/*
+ * Runs after blk_mq_hctx_notify_offline() has run for every hctx of the
+ * dying CPU.
+ */
+static int blk_mq_drain_inactive_hctxs(unsigned int cpu)
+{
+	struct blk_mq_hw_ctx *hctx, *tmp;
+	int ret = 0;
+
+	if (list_empty(&blk_mq_inactive_hctxs))
+		return 0;
+
+	/*
+	 * An allocation sets its tag bit and then tests the inactive flag, we
+	 * set the flag and then look for tags: both sides need a full barrier
+	 * for that, and the test_and_set_bit_lock() in sbitmap_get() only has
+	 * acquire semantics. Rather than adding a barrier to every allocation,
+	 * execute one on all CPUs from here, once for all the flags set above:
+	 * a tag taken before it is visible to us, the flags are visible to a
+	 * test that comes after it.
+	 */
+	on_each_cpu(blk_mq_ipi_mb, NULL, 1);
+
+	list_for_each_entry_safe(hctx, tmp, &blk_mq_inactive_hctxs,
+				 inactive_entry) {
+		list_del_init(&hctx->inactive_entry);
+		if (!ret)
+			ret = blk_mq_hctx_wait_inactive(hctx);
+		/* On failure the offline is rolled back and the CPU stays */
+		if (ret)
+			clear_bit(BLK_MQ_S_INACTIVE, &hctx->state);
+	}
 	return ret;
 }
 
@@ -4062,6 +4109,7 @@ blk_mq_alloc_hctx(struct request_queue *q, struct blk_mq_tag_set *set,
 	INIT_LIST_HEAD(&hctx->dispatch);
 	INIT_HLIST_NODE(&hctx->cpuhp_dead);
 	INIT_HLIST_NODE(&hctx->cpuhp_online);
+	INIT_LIST_HEAD(&hctx->inactive_entry);
 	hctx->queue = q;
 	hctx->flags = set->flags & ~BLK_MQ_F_TAG_QUEUE_SHARED;
 
@@ -5374,6 +5422,8 @@ static int __init blk_mq_init(void)
 	cpuhp_setup_state_multi(CPUHP_AP_BLK_MQ_ONLINE, "block/mq:online",
 				blk_mq_hctx_notify_online,
 				blk_mq_hctx_notify_offline);
+	cpuhp_setup_state_nocalls(CPUHP_AP_BLK_MQ_INACTIVE, "block/mq:inactive",
+				  NULL, blk_mq_drain_inactive_hctxs);
 	return 0;
 }
 subsys_initcall(blk_mq_init);

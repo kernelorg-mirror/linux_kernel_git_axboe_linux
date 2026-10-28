@@ -440,6 +440,8 @@ struct blk_mq_hw_ctx {
 
 	/** @cpuhp_online: List to store request if CPU is going to die */
 	struct hlist_node	cpuhp_online;
+	/** @inactive_entry: On the list of hctxs the dying CPU made inactive */
+	struct list_head	inactive_entry;
 	/** @cpuhp_dead: List to store request if some CPU die. */
 	struct hlist_node	cpuhp_dead;
 	/** @kobj: Kernel object for sysfs. */
