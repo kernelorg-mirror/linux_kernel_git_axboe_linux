@@ -140,6 +140,38 @@ static const struct kobj_type blk_mq_hw_ktype = {
 	.release	= blk_mq_hw_sysfs_release,
 };
 
+/*
+ * A ctx is mapped to one hctx per type, but a kobject can be added below one
+ * parent only. It lives below the default hctx, which is registered first,
+ * and the hctxs of the other types get a link to it.
+ */
+static int blk_mq_register_ctx(struct blk_mq_hw_ctx *hctx,
+			       struct blk_mq_ctx *ctx)
+{
+	char name[16];
+
+	if (hctx->type == HCTX_TYPE_DEFAULT)
+		return kobject_add(&ctx->kobj, &hctx->kobj, "cpu%u", ctx->cpu);
+
+	snprintf(name, sizeof(name), "cpu%u", ctx->cpu);
+	return sysfs_create_link(&hctx->kobj, &ctx->kobj, name);
+}
+
+static void blk_mq_unregister_ctx(struct blk_mq_hw_ctx *hctx,
+				  struct blk_mq_ctx *ctx)
+{
+	char name[16];
+
+	if (hctx->type == HCTX_TYPE_DEFAULT) {
+		if (ctx->kobj.state_in_sysfs)
+			kobject_del(&ctx->kobj);
+		return;
+	}
+
+	snprintf(name, sizeof(name), "cpu%u", ctx->cpu);
+	sysfs_remove_link(&hctx->kobj, name);
+}
+
 static void blk_mq_unregister_hctx(struct blk_mq_hw_ctx *hctx)
 {
 	struct blk_mq_ctx *ctx;
@@ -149,8 +181,7 @@ static void blk_mq_unregister_hctx(struct blk_mq_hw_ctx *hctx)
 		return;
 
 	hctx_for_each_ctx(hctx, ctx, i)
-		if (ctx->kobj.state_in_sysfs)
-			kobject_del(&ctx->kobj);
+		blk_mq_unregister_ctx(hctx, ctx);
 
 	if (hctx->kobj.state_in_sysfs)
 		kobject_del(&hctx->kobj);
@@ -170,7 +201,7 @@ static int blk_mq_register_hctx(struct blk_mq_hw_ctx *hctx)
 		return ret;
 
 	hctx_for_each_ctx(hctx, ctx, i) {
-		ret = kobject_add(&ctx->kobj, &hctx->kobj, "cpu%u", ctx->cpu);
+		ret = blk_mq_register_ctx(hctx, ctx);
 		if (ret)
 			goto out;
 	}
@@ -179,7 +210,7 @@ static int blk_mq_register_hctx(struct blk_mq_hw_ctx *hctx)
 out:
 	hctx_for_each_ctx(hctx, ctx, j) {
 		if (j < i)
-			kobject_del(&ctx->kobj);
+			blk_mq_unregister_ctx(hctx, ctx);
 	}
 	kobject_del(&hctx->kobj);
 	return ret;
