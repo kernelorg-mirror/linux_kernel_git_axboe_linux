@@ -150,8 +150,9 @@ void sbitmap_resize(struct sbitmap *sb, unsigned int depth)
 	for (i = 0; i < sb->map_nr; i++)
 		sbitmap_deferred_clear(&sb->map[i], 0, 0, 0);
 
-	sb->depth = depth;
-	sb->map_nr = DIV_ROUND_UP(sb->depth, bits_per_word);
+	/* Nobody is stopped for this: see __map_depth(). */
+	WRITE_ONCE(sb->depth, depth);
+	WRITE_ONCE(sb->map_nr, DIV_ROUND_UP(depth, bits_per_word));
 }
 EXPORT_SYMBOL_GPL(sbitmap_resize);
 
@@ -216,7 +217,7 @@ static unsigned int __map_depth_with_shallow(const struct sbitmap *sb,
 	unsigned int word_depth, reminder;
 
 	word_depth = __map_depth(sb, index);
-	if (shallow_depth >= sb->depth)
+	if (!word_depth || shallow_depth >= sb->depth)
 		return word_depth;
 
 	shallow_word_depth = word_depth * shallow_depth;
@@ -533,6 +534,9 @@ unsigned long __sbitmap_queue_get_batch(struct sbitmap_queue *sbq, int nr_tags,
 		unsigned long get_mask;
 		unsigned int map_depth = __map_depth(sb, index);
 		unsigned long val;
+
+		if (!map_depth)
+			goto next;
 
 		sbitmap_deferred_clear(map, 0, 0, 0);
 		val = READ_ONCE(map->word);

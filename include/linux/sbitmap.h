@@ -173,9 +173,17 @@ int sbitmap_init_node(struct sbitmap *sb, unsigned int depth, int shift,
 /* sbitmap internal helper */
 static inline unsigned int __map_depth(const struct sbitmap *sb, int index)
 {
-	if (index == sb->map_nr - 1)
-		return sb->depth - (index << sb->shift);
-	return 1U << sb->shift;
+	unsigned int depth = READ_ONCE(sb->depth);
+	unsigned int start = index << sb->shift;
+
+	/*
+	 * sbitmap_resize() doesn't wait for anybody, so @index may be from
+	 * before or after a resize. Derive everything from one load of
+	 * ->depth: a word past the end has no bits.
+	 */
+	if (depth <= start)
+		return 0;
+	return min(depth - start, 1U << sb->shift);
 }
 
 /**
@@ -247,8 +255,9 @@ static inline void __sbitmap_for_each_set(struct sbitmap *sb,
 
 	while (scanned < sb->depth) {
 		unsigned long word;
+		unsigned int map_depth = __map_depth(sb, index);
 		unsigned int depth = min_t(unsigned int,
-					   __map_depth(sb, index) - nr,
+					   map_depth > nr ? map_depth - nr : 0,
 					   sb->depth - scanned);
 
 		scanned += depth;
