@@ -3152,6 +3152,13 @@ static int io_uring_sanitise_params(struct io_uring_params *p)
 	    (IORING_SETUP_SQE128|IORING_SETUP_SQE_MIXED))
 		return -EINVAL;
 
+	/* Lockless submit needs a single issuer and no SQPOLL thread */
+	if (flags & IORING_SETUP_NO_URING_LOCK) {
+		if (!(flags & IORING_SETUP_SINGLE_ISSUER) ||
+		    (flags & IORING_SETUP_SQPOLL))
+			return -EINVAL;
+	}
+
 	/*
 	 * If IORING_SETUP_SQPOLL is set, only the SQ thread issues SQEs,
 	 * but other threads may call io_uring_register() concurrently.

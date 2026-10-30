@@ -253,6 +253,13 @@ enum io_uring_sqe_flags_bit {
  */
 #define IORING_SETUP_SQ_REWIND		(1U << 20)
 
+/*
+ * Skip the ctx uring_lock mutex on the submitter task. Requires
+ * IORING_SETUP_SINGLE_ISSUER and is incompatible with IORING_SETUP_SQPOLL.
+ * Test knob for comparing the locked and lockless submit paths.
+ */
+#define IORING_SETUP_NO_URING_LOCK	(1U << 21)
+
 enum io_uring_op {
 	IORING_OP_NOP,
 	IORING_OP_READV,

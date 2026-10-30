@@ -30,10 +30,11 @@
  * state. io_uring_register() also acquires the ctx uring lock because most
  * opcodes mutate io_ring_ctx state accessed in the issue path.
  *
- * For !IORING_SETUP_SINGLE_ISSUER io_ring_ctx's, acquiring the ctx uring lock
+ * For !IORING_SETUP_NO_URING_LOCK io_ring_ctx's, acquiring the ctx uring lock
  * is done via mutex_(try)lock(&ctx->uring_lock).
  *
- * However, for IORING_SETUP_SINGLE_ISSUER, we can avoid the mutex_lock() +
+ * However, for IORING_SETUP_NO_URING_LOCK (which requires
+ * IORING_SETUP_SINGLE_ISSUER), we can avoid the mutex_lock() +
  * mutex_unlock() overhead on submitter_task because a single thread can't race
  * with itself. In the uncommon case where the ctx uring lock is needed on
  * another thread, it must suspend submitter_task by scheduling a task work item
@@ -70,7 +71,7 @@ static inline void io_ring_ctx_lock_nested(struct io_ring_ctx *ctx,
 {
 	struct io_ring_suspend_work suspend_work;
 
-	if (!(ctx->flags & IORING_SETUP_SINGLE_ISSUER)) {
+	if (!(ctx->flags & IORING_SETUP_NO_URING_LOCK)) {
 		mutex_lock_nested(&ctx->uring_lock, subclass);
 		return;
 	}
@@ -116,7 +117,7 @@ static inline void io_ring_ctx_lock(struct io_ring_ctx *ctx,
 static inline bool io_ring_ctx_trylock(struct io_ring_ctx *ctx,
 				       struct io_ring_ctx_lock_state *state)
 {
-	if (!(ctx->flags & IORING_SETUP_SINGLE_ISSUER))
+	if (!(ctx->flags & IORING_SETUP_NO_URING_LOCK))
 		return mutex_trylock(&ctx->uring_lock);
 
 	state->suspend_end = NULL;
@@ -140,7 +141,7 @@ static inline bool io_ring_ctx_trylock(struct io_ring_ctx *ctx,
 static inline void io_ring_ctx_unlock(struct io_ring_ctx *ctx,
 				      struct io_ring_ctx_lock_state *state)
 {
-	if (!(ctx->flags & IORING_SETUP_SINGLE_ISSUER)) {
+	if (!(ctx->flags & IORING_SETUP_NO_URING_LOCK)) {
 		mutex_unlock(&ctx->uring_lock);
 		return;
 	}
@@ -158,7 +159,7 @@ static inline bool io_ring_ctx_lock_held(const struct io_ring_ctx *ctx)
 	 * No straightforward way to check that submitter_task is suspended
 	 * without access to struct io_ring_ctx_lock_state
 	 */
-	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER &&
+	if (ctx->flags & IORING_SETUP_NO_URING_LOCK &&
 	    !(ctx->flags & IORING_SETUP_R_DISABLED))
 		return true;
 
@@ -168,7 +169,7 @@ static inline bool io_ring_ctx_lock_held(const struct io_ring_ctx *ctx)
 /* Assert (if CONFIG_LOCKDEP) that the ctx uring lock is held */
 static inline void io_ring_ctx_assert_locked(const struct io_ring_ctx *ctx)
 {
-	if (ctx->flags & IORING_SETUP_SINGLE_ISSUER &&
+	if (ctx->flags & IORING_SETUP_NO_URING_LOCK &&
 	    !(ctx->flags & IORING_SETUP_R_DISABLED))
 		return;
 
@@ -238,6 +239,7 @@ struct io_ctx_config {
 			IORING_SETUP_HYBRID_IOPOLL |\
 			IORING_SETUP_CQE_MIXED |\
 			IORING_SETUP_SQE_MIXED |\
+			IORING_SETUP_NO_URING_LOCK |\
 			IORING_SETUP_SQ_REWIND)
 
 #define IORING_ENTER_FLAGS (IORING_ENTER_GETEVENTS |\
