@@ -321,6 +321,45 @@ void io_ring_suspend_work(struct callback_head *cb_head)
 	wait_for_completion(&suspend_end);
 }
 
+/*
+ * Slow path of io_ring_ctx_lock_nested() for IORING_SETUP_NO_URING_LOCK:
+ * not the submitter, or the ring is still IORING_SETUP_R_DISABLED.
+ */
+void __io_ring_ctx_lock_slow(struct io_ring_ctx *ctx, unsigned int subclass,
+			     struct io_ring_ctx_lock_state *state)
+{
+	struct io_ring_suspend_work suspend_work;
+
+	state->mutex_held = false;
+	state->suspend_end = NULL;
+	if (unlikely(smp_load_acquire(&ctx->flags) & IORING_SETUP_R_DISABLED)) {
+		mutex_lock_nested(&ctx->uring_lock, subclass);
+		if (likely(!ctx->submitter_task)) {
+			state->mutex_held = true;
+			return;
+		}
+
+		/* submitter_task set concurrently, must suspend it */
+		mutex_unlock(&ctx->uring_lock);
+	} else if (current == ctx->submitter_task) {
+		return;
+	}
+
+	/* Use task work to suspend submitter_task */
+	init_task_work(&suspend_work.cb_head, io_ring_suspend_work);
+	init_completion(&suspend_work.suspend_start);
+	suspend_work.suspend_end = &state->suspend_end;
+	if (unlikely(task_work_add(ctx->submitter_task, &suspend_work.cb_head,
+				   TWA_SIGNAL))) {
+		/* submitter_task is exiting, use mutex instead */
+		state->mutex_held = true;
+		mutex_lock_nested(&ctx->uring_lock, subclass);
+		return;
+	}
+
+	wait_for_completion(&suspend_work.suspend_start);
+}
+
 static void io_clean_op(struct io_kiocb *req)
 {
 	if (unlikely(req->flags & REQ_F_BUFFER_SELECTED))

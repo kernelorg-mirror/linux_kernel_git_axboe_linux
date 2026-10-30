@@ -64,46 +64,31 @@ struct io_ring_ctx_lock_state {
 	struct completion *suspend_end;
 };
 
+void __io_ring_ctx_lock_slow(struct io_ring_ctx *ctx, unsigned int subclass,
+			     struct io_ring_ctx_lock_state *state);
+
 /* Acquire the ctx uring lock with the given nesting level */
-static inline void io_ring_ctx_lock_nested(struct io_ring_ctx *ctx,
+static __always_inline void io_ring_ctx_lock_nested(struct io_ring_ctx *ctx,
 					   unsigned int subclass,
 					   struct io_ring_ctx_lock_state *state)
 {
-	struct io_ring_suspend_work suspend_work;
-
 	if (!(ctx->flags & IORING_SETUP_NO_URING_LOCK)) {
 		mutex_lock_nested(&ctx->uring_lock, subclass);
 		return;
 	}
 
-	state->mutex_held = false;
-	state->suspend_end = NULL;
-	if (unlikely(smp_load_acquire(&ctx->flags) & IORING_SETUP_R_DISABLED)) {
-		mutex_lock_nested(&ctx->uring_lock, subclass);
-		if (likely(!ctx->submitter_task)) {
-			state->mutex_held = true;
-			return;
-		}
-
-		/* submitter_task set concurrently, must suspend it */
-		mutex_unlock(&ctx->uring_lock);
-	} else if (likely(current == ctx->submitter_task)) {
+	/*
+	 * Fast path: ring enabled and we are the submitter, nothing to take.
+	 * Keep the slow path out of line so this stays small enough to inline.
+	 */
+	if (likely(!(smp_load_acquire(&ctx->flags) & IORING_SETUP_R_DISABLED) &&
+		   current == ctx->submitter_task)) {
+		state->mutex_held = false;
+		state->suspend_end = NULL;
 		return;
 	}
 
-	/* Use task work to suspend submitter_task */
-	init_task_work(&suspend_work.cb_head, io_ring_suspend_work);
-	init_completion(&suspend_work.suspend_start);
-	suspend_work.suspend_end = &state->suspend_end;
-	if (unlikely(task_work_add(ctx->submitter_task, &suspend_work.cb_head,
-				   TWA_SIGNAL))) {
-		/* submitter_task is exiting, use mutex instead */
-		state->mutex_held = true;
-		mutex_lock_nested(&ctx->uring_lock, subclass);
-		return;
-	}
-
-	wait_for_completion(&suspend_work.suspend_start);
+	__io_ring_ctx_lock_slow(ctx, subclass, state);
 }
 
 /* Acquire the ctx uring lock */
