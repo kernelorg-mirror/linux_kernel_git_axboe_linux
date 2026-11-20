@@ -394,6 +394,11 @@ int bio_integrity_map_user(struct bio *bio, struct iov_iter *iter)
 	copy = iov_iter_alignment(iter) &
 			blk_lim_dma_alignment_and_pad(&q->limits);
 
+	/* Reference-tag remapping must operate on a private copy of user PI. */
+	if (bio_op(bio) == REQ_OP_WRITE &&
+	    (q->limits.integrity.flags & BLK_INTEGRITY_REF_TAG))
+		copy = true;
+
 	if (blk_queue_pci_p2pdma(q))
 		extraction_flags |= ITER_ALLOW_P2PDMA;
 
