@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 
-CFLAGS += -O3 -Wl,-no-as-needed -Wall -I $(top_srcdir)/usr/include
+CFLAGS += -O3 -Wl,-no-as-needed -Wall $(KHDR_INCLUDES)
 CFLAGS += -D_FILE_OFFSET_BITS=64
 ifneq ($(WERROR),0)
 	CFLAGS += -Werror
@@ -86,6 +86,7 @@ include ../lib.mk
 
 $(OUTPUT)/kublk: $(filter-out $(STANDALONE_UTILS),$(wildcard *.c))
 $(OUTPUT)/ublk_cancel_ready: ublk_cancel_ready.c ctrl.c
+$(TEST_GEN_PROGS_EXTENDED): | headers
 
 check:
 	shellcheck -x -f gcc *.sh
