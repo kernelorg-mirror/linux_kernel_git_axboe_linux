@@ -9,7 +9,8 @@ Zoned Loop Block Device
 	1) Overview
 	2) Creating a Zoned Device
 	3) Deleting a Zoned Device
-	4) Example
+	4)  Degrading a storage element
+	5) Example
 
 
 1) Overview
@@ -61,8 +62,9 @@ The options available for the add command can be listed by reading the
 /dev/zloop-control device::
 
 	$ cat /dev/zloop-control
-        add id=%d,capacity_mb=%u,zone_size_mb=%u,zone_capacity_mb=%u,conv_zones=%u,max_open_zones=%u,base_dir=%s,nr_queues=%u,queue_depth=%u,buffered_io,zone_append=%u,ordered_zone_append,discard_write_cache
+        add id=%d,capacity_mb=%u,zone_size_mb=%u,zone_capacity_mb=%u,conv_zones=%u,max_open_zones=%u,base_dir=%s,nr_queues=%u,queue_depth=%u,buffered_io,zone_append=%u,ordered_zone_append,discard_write_cache,stor_elements=%u
         remove id=%d
+        degrade_element id=%d,element_id=%u
 
 In more details, the options that can be used with the "add" command are as
 follows.
@@ -113,6 +115,15 @@ discard_write_cache   Discard all data that was not explicitly persisted using a
                       each zone file to the size recorded during the last flush
                       operation. This simulates power fail events where
                       uncommitted data is lost.
+stor_elements         Control storage element emulation. The default value is
+                      0, indicating no emulation. A value of 1 indicates that
+                      storage elements are emulated as full access physical
+                      elements, which is equivalent to combined read+write heads
+                      of a hard-disk. A value of 2 enables storage element
+                      emulation as fractional access physical storage elements,
+                      which is equivalent to pairs of read and write heads of a
+                      hard-disk. The health state of storage elements is not
+                      preserved across a zloop device remove and add.
 ===================   =========================================================
 
 3) Deleting a Zoned Device
@@ -135,7 +146,26 @@ the zoned device will not be created.
 To fully delete a zoned device, after executing the remove operation, the device
 base directory containing the backing files of the device zones must be deleted.
 
-4) Example
+4) Degrading a storage element
+------------------------------
+
+When storage element emulation is enabled, storage elements can be set in a
+degraded state to emulate defective storage elements (e.g. defective heads of a
+hard disk). This is done by issuing the "degrade_element" command to
+/dev/zloop-control, specifying the ID of the target device and the ID of the
+storage element to degrade::
+
+        $ echo "degrade_element id=X,element_id=Y" > /dev/zloop-control
+
+Depending on the type of the storage element specified, a read or write access
+to sectors of a zone served by a degraded storage element will result in a
+failure. For partial access storage elements, write accesses are always failed
+if the write element serving the zone is degraded. Likewise, read accesses are
+failed if the read element serving the zone is degraded. When storage elements
+are emulated as all access physical elements, both read and write operations are
+failed when the storage element serving the zones being accessed is degraded.
+
+5) Example
 ----------
 
 The following sequence of commands creates a 2GB zoned device with zones of 64
